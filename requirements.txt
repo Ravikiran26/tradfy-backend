@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+anthropic
+supabase
+python-multipart
+pillow
+python-dotenv
+httpx
+pandas
+openpyxl
+yfinance
+scipy
+numpy
