@@ -792,7 +792,7 @@ def trade_fundamentals(
     return data
 
 
-FREE_AI_LIMIT = 10  # free analyses per user
+FREE_AI_LIMIT = 9999  # free analyses per user (temporarily unlimited for review)
 
 
 # ── GET /trades/usage ─────────────────────────────────────────────────────────
