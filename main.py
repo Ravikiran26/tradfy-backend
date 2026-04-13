@@ -7,6 +7,7 @@ import os
 
 from routes.trades import router as trades_router
 from routes.import_trades import router as import_router
+from routes.payments import router as payments_router
 
 app = FastAPI(title="Tradfy API", version="1.0.0")
 
@@ -24,6 +25,7 @@ app.add_middleware(
 
 app.include_router(trades_router)
 app.include_router(import_router)
+app.include_router(payments_router)
 
 
 @app.get("/")
