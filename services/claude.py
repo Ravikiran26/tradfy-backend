@@ -359,11 +359,38 @@ def _build_history_summary(user_history: dict) -> str:
     return "\n".join(lines)
 
 
-def generate_trade_feedback(trade_data: dict, market_context: Optional[dict] = None) -> str:
+def _build_checklist_block(checklist: Optional[dict]) -> str:
+    """Build a checklist context block for Claude prompts."""
+    if not checklist:
+        return ""
+    lines = ["\nTrader's pre-trade checklist answers:"]
+    mapping = {
+        "planned": ("Was this trade planned in advance?", "planned", "impulsive"),
+        "stoploss": ("Did they set a stop loss before entering?", "yes", "no"),
+        "strategy": ("Did they follow their own strategy?", "yes, followed strategy", "no, broke rules"),
+    }
+    for key, (question, yes_label, no_label) in mapping.items():
+        val = checklist.get(key)
+        if val in ("yes", "no"):
+            answer = yes_label if val == "yes" else no_label
+            lines.append(f"- {question} → {answer}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
+def generate_trade_feedback(
+    trade_data: dict,
+    market_context: Optional[dict] = None,
+    checklist: Optional[dict] = None,
+) -> str:
     """Send trade data to Claude and get 3 coaching insights. Routes by trade_type."""
     from services.market_data import market_context_prompt_block
     trade_summary = _build_trade_summary(trade_data)
     ctx_block = market_context_prompt_block(market_context) if market_context else ""
+    checklist_block = _build_checklist_block(checklist)
+    if checklist_block:
+        ctx_block = ctx_block + checklist_block if ctx_block else checklist_block
 
     trade_type = trade_data.get("trade_type", "options_intraday")
     if trade_type == "options_scalping":
@@ -561,6 +588,7 @@ def generate_swing_feedback(
     user_history: dict,
     swing_ctx: Optional[dict] = None,
     fundamentals: Optional[dict] = None,
+    checklist: Optional[dict] = None,
 ) -> str:
     """
     Generate plain-English coaching for equity_swing or futures_swing trades.
@@ -571,6 +599,9 @@ def generate_swing_feedback(
     history_summary = _build_history_summary(user_history)
     ctx_block = _build_swing_context_block(swing_ctx)
     fund_block = _build_fundamentals_block(fundamentals)
+    checklist_block = _build_checklist_block(checklist)
+    if checklist_block:
+        history_summary = history_summary + "\n" + checklist_block
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",

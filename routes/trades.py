@@ -105,6 +105,9 @@ async def upload_trade_screenshot(
     file: UploadFile = File(...),
     linked_trade_id: Optional[str] = Form(default=None),
     trade_type_override: Optional[str] = Form(default=None),
+    checklist_planned: Optional[str] = Form(default=None),   # "yes" | "no"
+    checklist_stoploss: Optional[str] = Form(default=None),  # "yes" | "no"
+    checklist_strategy: Optional[str] = Form(default=None),  # "yes" | "no"
     user_id: str = Depends(get_current_user),
 ):
     """
@@ -155,6 +158,15 @@ async def upload_trade_screenshot(
 
     trade_type = trade_data.get("trade_type", "options_intraday")
     status     = trade_data.get("status", "closed")
+
+    # Build checklist context for AI prompts
+    checklist_ctx = None
+    if any([checklist_planned, checklist_stoploss, checklist_strategy]):
+        checklist_ctx = {
+            "planned": checklist_planned,
+            "stoploss": checklist_stoploss,
+            "strategy": checklist_strategy,
+        }
 
     # ── Branch: swing open ───────────────────────────────────────────────────
     if trade_type in SWING_TYPES and status == "open":
@@ -208,7 +220,7 @@ async def upload_trade_screenshot(
         completed_trade_data = {**updated}
         try:
             user_history = get_user_trade_history(user_id)
-            feedback = generate_swing_feedback(completed_trade_data, user_history)
+            feedback = generate_swing_feedback(completed_trade_data, user_history, checklist=checklist_ctx)
         except Exception:
             feedback = "Feedback unavailable at this time."
 
@@ -235,7 +247,7 @@ async def upload_trade_screenshot(
     try:
         if trade_type in SWING_TYPES:
             user_history = get_user_trade_history(user_id)
-            feedback = generate_swing_feedback(trade_data, user_history)
+            feedback = generate_swing_feedback(trade_data, user_history, checklist=checklist_ctx)
         else:
             # Fetch market context (VIX + Greeks) for options trades — non-blocking
             mkt_ctx = None
@@ -246,7 +258,7 @@ async def upload_trade_screenshot(
                 )
             except Exception:
                 pass
-            feedback = generate_trade_feedback(trade_data, market_context=mkt_ctx)
+            feedback = generate_trade_feedback(trade_data, market_context=mkt_ctx, checklist=checklist_ctx)
     except Exception:
         feedback = "Feedback unavailable at this time."
 
@@ -781,6 +793,172 @@ def trade_fundamentals(
 
 
 FREE_AI_LIMIT = 10  # free AI analyses per user on the free tier
+
+
+# ── GET /trades/streak ────────────────────────────────────────────────────────
+
+@router.get("/streak")
+def get_streak(user_id: str = Depends(get_current_user)):
+    """
+    Return current win/loss streak + a losing streak alert if 3+ consecutive losses.
+    Alert includes pattern analysis (trade type, day of week, sector).
+    """
+    from datetime import date as _date
+    trades = get_user_trades(user_id)
+    closed = sorted(
+        [t for t in trades if t.get("pnl") is not None and t.get("status") != "open"],
+        key=lambda t: str(t.get("trade_date") or t.get("created_at") or ""),
+        reverse=True,
+    )
+
+    if not closed:
+        return {"streak_type": None, "streak_count": 0, "alert": None}
+
+    first_is_win = (closed[0].get("pnl") or 0) > 0
+    count = 0
+    for t in closed:
+        if ((t.get("pnl") or 0) > 0) == first_is_win:
+            count += 1
+        else:
+            break
+
+    streak_type = "win" if first_is_win else "loss"
+    alert = None
+
+    if streak_type == "loss" and count >= 3:
+        losing_trades = closed[:count]
+        total_loss = sum(t.get("pnl") or 0 for t in losing_trades)
+        patterns = []
+
+        # Check if one trade type dominates
+        type_counts: dict = {}
+        for t in losing_trades:
+            tt = t.get("trade_type") or "unknown"
+            type_counts[tt] = type_counts.get(tt, 0) + 1
+        top_type = max(type_counts.items(), key=lambda x: x[1])
+        if top_type[1] >= max(2, round(count * 0.6)):
+            type_labels = {
+                "options_intraday": "options intraday",
+                "options_scalping": "options scalping",
+                "equity_swing": "equity swing",
+                "futures_swing": "futures",
+            }
+            patterns.append(f"All {top_type[1]} were {type_labels.get(top_type[0], top_type[0])} trades")
+
+        # Check Thursday dominance
+        thu_count = 0
+        for t in losing_trades:
+            try:
+                d = _date.fromisoformat(str(t.get("trade_date", "")))
+                if d.weekday() == 3:
+                    thu_count += 1
+            except (ValueError, TypeError):
+                pass
+        if thu_count >= 2 and thu_count >= round(count * 0.5):
+            patterns.append(f"{thu_count} of {count} losses were on Thursday (expiry day)")
+
+        # Check sector dominance
+        sector_counts: dict = {}
+        for t in losing_trades:
+            s = t.get("sector")
+            if s:
+                sector_counts[s] = sector_counts.get(s, 0) + 1
+        if sector_counts:
+            top_sector = max(sector_counts.items(), key=lambda x: x[1])
+            if top_sector[1] >= 2:
+                # Compute all-time win rate for that sector
+                sector_trades = [t for t in trades if t.get("sector") == top_sector[0] and t.get("pnl") is not None]
+                sector_wr = round(
+                    sum(1 for t in sector_trades if (t.get("pnl") or 0) > 0) / len(sector_trades) * 100, 0
+                ) if sector_trades else 0
+                patterns.append(f"{top_sector[1]} of {count} losses were in {top_sector[0]} (your win rate there: {sector_wr:.0f}%)")
+
+        alert = {
+            "message": f"{count} losses in a row — ₹{abs(total_loss):,.0f} total drawdown",
+            "patterns": patterns,
+            "tip": "Step back before the next trade. Losing streaks often end when you reduce size or skip one session.",
+        }
+
+    return {
+        "streak_type": streak_type,
+        "streak_count": count,
+        "alert": alert,
+    }
+
+
+# ── GET /trades/weekly-report ─────────────────────────────────────────────────
+
+@router.get("/weekly-report")
+def weekly_report(user_id: str = Depends(get_current_user)):
+    """
+    Compare this week (Mon–today) vs last week.
+    Returns P&L, win rate, trade count, and one focus for next week.
+    """
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    days_since_monday = now.weekday()  # Mon=0 … Sun=6
+    week_start = (now - timedelta(days=days_since_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    last_week_start = week_start - timedelta(days=7)
+
+    trades = get_user_trades(user_id)
+
+    def _parse_dt(t: dict):
+        raw = t.get("trade_date") or t.get("created_at")
+        if not raw:
+            return None
+        try:
+            s = str(raw)
+            if len(s) == 10:
+                return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+
+    def _week_stats(start: datetime, end: datetime) -> dict:
+        bucket = [
+            t for t in trades
+            if (dt := _parse_dt(t)) and start <= dt < end and t.get("pnl") is not None
+        ]
+        wins = [t for t in bucket if (t.get("pnl") or 0) > 0]
+        losses = [t for t in bucket if (t.get("pnl") or 0) <= 0]
+        total_pnl = round(sum(t["pnl"] for t in bucket), 2)
+        best = max(bucket, key=lambda t: t.get("pnl") or 0) if bucket else None
+        worst = min(bucket, key=lambda t: t.get("pnl") or 0) if bucket else None
+        return {
+            "total_trades": len(bucket),
+            "wins": len(wins),
+            "losses": len(losses),
+            "total_pnl": total_pnl,
+            "win_rate": round(len(wins) / len(bucket) * 100, 1) if bucket else 0.0,
+            "best_trade": {"symbol": best.get("symbol"), "pnl": best.get("pnl")} if best else None,
+            "worst_trade": {"symbol": worst.get("symbol"), "pnl": worst.get("pnl")} if worst else None,
+        }
+
+    this_week = _week_stats(week_start, now + timedelta(days=1))
+    last_week = _week_stats(last_week_start, week_start)
+
+    # One focus for next week — derived from patterns
+    focus = None
+    if this_week["losses"] > this_week["wins"] and this_week["total_trades"] >= 2:
+        focus = "Your win rate dropped this week. Before the next trade, write down your setup rules and check them."
+    elif last_week["total_pnl"] > 0 and this_week["total_pnl"] < 0:
+        focus = "You were profitable last week but not this week. Stick to what worked last week — don't change your strategy mid-streak."
+    elif this_week["total_trades"] == 0:
+        focus = "No trades logged yet this week. Consistency matters — even reviewing old trades counts."
+    elif this_week["wins"] > 0 and this_week["win_rate"] >= 60:
+        focus = "Good week! Protect it — avoid impulsive trades in the last session of the week."
+    else:
+        focus = "Log every trade this week, including the small ones. Patterns only show up in the data."
+
+    return {
+        "this_week": this_week,
+        "last_week": last_week,
+        "pnl_change": round(this_week["total_pnl"] - last_week["total_pnl"], 2),
+        "win_rate_change": round(this_week["win_rate"] - last_week["win_rate"], 1),
+        "focus": focus,
+    }
 
 
 # ── GET /trades/usage ─────────────────────────────────────────────────────────
