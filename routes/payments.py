@@ -2,9 +2,10 @@ import os
 import hmac
 import hashlib
 import razorpay
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from services.supabase_client import get_db
+from services.supabase_client import get_client as get_db
+from auth import get_current_user
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -35,7 +36,7 @@ class CreateOrderRequest(BaseModel):
 @router.post("/create-order")
 def create_order(
     body: CreateOrderRequest,
-    x_user_id: str = Header(...),
+    user_id: str = Depends(get_current_user),
 ):
     if body.plan not in PLAN_AMOUNTS:
         raise HTTPException(status_code=400, detail="Invalid plan. Use 'monthly' or 'yearly'.")
@@ -48,7 +49,7 @@ def create_order(
             "amount":   amount,
             "currency": "INR",
             "notes": {
-                "user_id": x_user_id,
+                "user_id": user_id,
                 "plan":    body.plan,
             },
         })
@@ -74,7 +75,7 @@ class VerifyPaymentRequest(BaseModel):
 @router.post("/verify")
 def verify_payment(
     body: VerifyPaymentRequest,
-    x_user_id: str = Header(...),
+    user_id: str = Depends(get_current_user),
 ):
     # Verify signature
     message = f"{body.razorpay_order_id}|{body.razorpay_payment_id}"
@@ -91,7 +92,7 @@ def verify_payment(
     db = get_db()
     try:
         db.table("users").upsert({
-            "id":         x_user_id,
+            "id":         user_id,
             "is_pro":     True,
             "pro_plan":   body.plan,
             "pro_since":  "now()",
@@ -102,7 +103,7 @@ def verify_payment(
             "is_pro":    True,
             "pro_plan":  body.plan,
             "pro_since": "now()",
-        }).eq("id", x_user_id).execute()
+        }).eq("id", user_id).execute()
 
     return {"success": True, "is_pro": True, "plan": body.plan}
 
@@ -110,9 +111,9 @@ def verify_payment(
 # ── GET /payments/status ──────────────────────────────────────────────────────
 
 @router.get("/status")
-def payment_status(x_user_id: str = Header(...)):
+def payment_status(user_id: str = Depends(get_current_user)):
     db = get_db()
-    result = db.table("users").select("is_pro, pro_plan, pro_since").eq("id", x_user_id).execute()
+    result = db.table("users").select("is_pro, pro_plan, pro_since").eq("id", user_id).execute()
     if result.data:
         row = result.data[0]
         return {

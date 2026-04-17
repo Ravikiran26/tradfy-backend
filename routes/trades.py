@@ -1,6 +1,9 @@
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Header
+from fastapi import APIRouter, Depends, File, Form, UploadFile, HTTPException, Request
 from typing import Optional
 from datetime import datetime, timezone, date as date_cls
+
+from auth import get_current_user
+from rate_limit import limiter
 
 from services.market_data import get_market_context, get_swing_context, get_fundamentals
 from models import (
@@ -51,12 +54,6 @@ SWING_TYPES      = {"equity_swing", "futures_swing"}
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _require_user(x_user_id: Optional[str]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
-
 async def _read_image(file: UploadFile) -> tuple[bytes, str]:
     """Validate content-type and size; return (bytes, normalised media_type)."""
     content_type = file.content_type or ""
@@ -102,11 +99,13 @@ def _calculate_pnl(open_trade: dict, exit_price: float) -> tuple[float, float]:
 # ── POST /trades/upload ───────────────────────────────────────────────────────
 
 @router.post("/upload")
+@limiter.limit("20/minute")
 async def upload_trade_screenshot(
+    request: Request,
     file: UploadFile = File(...),
     linked_trade_id: Optional[str] = Form(default=None),
     trade_type_override: Optional[str] = Form(default=None),
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Accept a broker screenshot and:
@@ -118,7 +117,6 @@ async def upload_trade_screenshot(
     trade_type_override: optional — if user explicitly selected the trade type on the frontend,
     use it instead of the AI-detected type (e.g. options_scalping, options_positional).
     """
-    user_id = _require_user(x_user_id)
     image_bytes, media_type = await _read_image(file)
 
     # ── Extract all trades from screenshot ───────────────────────────────────
@@ -217,13 +215,13 @@ async def upload_trade_screenshot(
         # Save the close screenshot as a linked record for audit trail
         close_payload = {
             **trade_data,
-            "user_id":        user_id,
+            "user_id":         user_id,
             "linked_trade_id": linked_trade_id,
             "status":          "closed",
-            "pnl":             pnl,
-            "pnl_percent":     pnl_pct,
-            "holding_days":    holding_days,
-            "closed_at":       now_iso,
+            "pnl":             updated.get("pnl"),
+            "pnl_percent":     updated.get("pnl_percent"),
+            "holding_days":    updated.get("holding_days"),
+            "closed_at":       updated.get("closed_at"),
             "ai_feedback":     feedback,
         }
         try:
@@ -267,14 +265,13 @@ async def upload_trade_screenshot(
 def close_trade_manual(
     trade_id: str,
     body: ClosePositionRequest,
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Close an open position using a JSON body (no screenshot required).
     Useful when exit_price is already known (e.g. from order history).
     Calculates P&L and holding_days server-side, then generates swing feedback.
     """
-    user_id = _require_user(x_user_id)
 
     sell_data = {
         "exit_price":        body.exit_price,
@@ -306,9 +303,8 @@ def close_trade_manual(
 # ── GET /trades/open ──────────────────────────────────────────────────────────
 
 @router.get("/open", response_model=list[OpenPosition])
-def open_positions(x_user_id: Optional[str] = Header(default=None)):
+def open_positions(user_id: str = Depends(get_current_user)):
     """Return all open swing positions with days_held calculated."""
-    user_id = _require_user(x_user_id)
     try:
         rows = get_open_positions(user_id)
     except Exception as e:
@@ -324,17 +320,18 @@ def open_positions(x_user_id: Optional[str] = Header(default=None)):
 # ── POST /trades/{trade_id}/close ────────────────────────────────────────────
 
 @router.post("/{trade_id}/close", response_model=FeedbackResponse)
+@limiter.limit("20/minute")
 async def close_trade_position(
+    request: Request,
     trade_id: str,
     file: UploadFile = File(...),
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Accept a sell/exit screenshot for an open position.
     Matches to the open trade, calculates P&L + holding_days,
     updates the original record to closed, returns full swing feedback.
     """
-    user_id = _require_user(x_user_id)
 
     open_trade = get_trade_by_id(trade_id, user_id)
     if not open_trade:
@@ -371,7 +368,7 @@ async def close_trade_position(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to close trade: {str(e)}")
 
-    completed_trade_data = {**open_trade, **close_update}
+    completed_trade_data = {**open_trade, **updated}
     try:
         user_history = get_user_trade_history(user_id)
         feedback = generate_swing_feedback(completed_trade_data, user_history)
@@ -390,14 +387,13 @@ async def close_trade_position(
 # ── GET /trades/patterns/swing ────────────────────────────────────────────────
 
 @router.get("/patterns/swing", response_model=SwingPatterns)
-def swing_patterns(x_user_id: Optional[str] = Header(default=None)):
+def swing_patterns(user_id: str = Depends(get_current_user)):
     """
     Swing-specific pattern analysis:
     sector win rate, avg holding days winners vs losers,
     dead money positions (open > 2× avg winner hold time),
     panic sell count (closed < 2 days with a loss).
     """
-    user_id = _require_user(x_user_id)
     try:
         data = get_swing_patterns(user_id)
     except Exception as e:
@@ -420,13 +416,12 @@ def swing_patterns(x_user_id: Optional[str] = Header(default=None)):
 # ── GET /trades/patterns/options ──────────────────────────────────────────────
 
 @router.get("/patterns/options", response_model=OptionsPatterns)
-def options_patterns(x_user_id: Optional[str] = Header(default=None)):
+def options_patterns(user_id: str = Depends(get_current_user)):
     """
     Options-intraday pattern analysis:
     expiry day (Thursday) win rate vs other days,
     time slot win rate by IST hour bucket (from upload time).
     """
-    user_id = _require_user(x_user_id)
     try:
         data = get_options_patterns(user_id)
     except Exception as e:
@@ -448,13 +443,12 @@ def options_patterns(x_user_id: Optional[str] = Header(default=None)):
 # ── GET /trades/patterns/expiry ──────────────────────────────────────────────
 
 @router.get("/patterns/expiry")
-def expiry_patterns(x_user_id: Optional[str] = Header(default=None)):
+def expiry_patterns(user_id: str = Depends(get_current_user)):
     """
     Expiry day intelligence:
     - Win rate + avg P&L for each day of week (Mon–Fri)
     - Thursday broken down by week-of-month (1st–4th)
     """
-    user_id = _require_user(x_user_id)
     try:
         data = get_expiry_stats(user_id)
     except Exception as e:
@@ -465,9 +459,8 @@ def expiry_patterns(x_user_id: Optional[str] = Header(default=None)):
 # ── GET /trades/patterns/intraday ────────────────────────────────────────────
 
 @router.get("/patterns/intraday")
-def intraday_patterns(x_user_id: Optional[str] = Header(default=None)):
+def intraday_patterns(user_id: str = Depends(get_current_user)):
     """Overtrading, revenge trading, and best underlying for intraday options traders."""
-    user_id = _require_user(x_user_id)
     try:
         data = get_intraday_patterns(user_id)
     except Exception as e:
@@ -478,9 +471,8 @@ def intraday_patterns(x_user_id: Optional[str] = Header(default=None)):
 # ── GET /trades/patterns/options-depth ───────────────────────────────────────
 
 @router.get("/patterns/options-depth")
-def options_depth_patterns(x_user_id: Optional[str] = Header(default=None)):
+def options_depth_patterns(user_id: str = Depends(get_current_user)):
     """Strike selection (OTM/ATM/ITM) and hold-time patterns for options trades."""
-    user_id = _require_user(x_user_id)
     try:
         data = get_options_depth_stats(user_id)
     except Exception as e:
@@ -491,13 +483,12 @@ def options_depth_patterns(x_user_id: Optional[str] = Header(default=None)):
 # ── GET /trades/patterns/insights ────────────────────────────────────────────
 
 @router.get("/patterns/insights")
-def pattern_insights(x_user_id: Optional[str] = Header(default=None)):
+def pattern_insights(user_id: str = Depends(get_current_user)):
     """
     Compute AI-style pattern insights from all the user's closed trades.
     Returns up to 5 insight objects with title, body, severity, and icon.
     Requires at least 5 closed trades; returns empty list otherwise.
     """
-    user_id = _require_user(x_user_id)
     trades = get_user_trades(user_id)
     closed = [t for t in trades if t.get("pnl") is not None and t.get("status") != "open"]
 
@@ -709,14 +700,13 @@ def pattern_insights(x_user_id: Optional[str] = Header(default=None)):
 @router.get("/{trade_id}/market-context")
 def trade_market_context(
     trade_id: str,
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Return VIX, spot price, and Black-Scholes Greeks for an options trade
     at the time it was traded. Used by the frontend drawer for context display.
     Returns 404 if the trade is not an options instrument or data is unavailable.
     """
-    user_id = _require_user(x_user_id)
     trade = get_trade_by_id(trade_id, user_id)
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -738,13 +728,12 @@ def trade_market_context(
 @router.get("/{trade_id}/swing-context")
 def trade_swing_context(
     trade_id: str,
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Return price vs EMAs, 52-week range, trend, candlestick, VIX and NIFTY
     for a swing (equity/futures) trade at entry time.
     """
-    user_id = _require_user(x_user_id)
     trade = get_trade_by_id(trade_id, user_id)
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -771,13 +760,12 @@ def trade_swing_context(
 @router.get("/{trade_id}/fundamentals")
 def trade_fundamentals(
     trade_id: str,
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Return key fundamental data (P/E, P/B, EPS growth, ROE, D/E, market cap, etc.)
     for equity swing trades via yfinance.
     """
-    user_id = _require_user(x_user_id)
     trade = get_trade_by_id(trade_id, user_id)
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -792,15 +780,14 @@ def trade_fundamentals(
     return data
 
 
-FREE_AI_LIMIT = 9999  # free analyses per user (temporarily unlimited for review)
+FREE_AI_LIMIT = 10  # free AI analyses per user on the free tier
 
 
 # ── GET /trades/usage ─────────────────────────────────────────────────────────
 
 @router.get("/usage")
-def get_usage(x_user_id: Optional[str] = Header(default=None)):
+def get_usage(user_id: str = Depends(get_current_user)):
     """Return AI analysis usage count for the current user."""
-    user_id = _require_user(x_user_id)
     used = count_ai_analyses(user_id)
     return {
         "ai_analyses_used":  used,
@@ -813,15 +800,16 @@ def get_usage(x_user_id: Optional[str] = Header(default=None)):
 # ── POST /trades/{trade_id}/generate-coaching ────────────────────────────────
 
 @router.post("/{trade_id}/generate-coaching")
+@limiter.limit("30/minute")
 def generate_coaching(
+    request: Request,
     trade_id: str,
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Generate AI coaching from stored trade data (no screenshot needed).
     Used for CSV-imported trades that have no ai_feedback yet.
     """
-    user_id = _require_user(x_user_id)
     trade = get_trade_by_id(trade_id, user_id)
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -885,16 +873,17 @@ def generate_coaching(
 # ── GET /trades/{trade_id}/autopsy ───────────────────────────────────────────
 
 @router.get("/{trade_id}/autopsy")
+@limiter.limit("20/minute")
 def trade_autopsy(
+    request: Request,
     trade_id: str,
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Deep post-trade autopsy via Claude.
     Loss → entry failure, exit discipline, primary cause, risk lesson.
     Profit → trailing stop sim, exit timing, profit capture %, optimization tip.
     """
-    user_id = _require_user(x_user_id)
     trade = get_trade_by_id(trade_id, user_id)
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -917,9 +906,8 @@ def trade_autopsy(
 # ── GET /trades/my ────────────────────────────────────────────────────────────
 
 @router.get("/my", response_model=list[Trade])
-def my_trades(x_user_id: Optional[str] = Header(default=None)):
+def my_trades(user_id: str = Depends(get_current_user)):
     """Return all trades for the authenticated user, newest first."""
-    user_id = _require_user(x_user_id)
     try:
         trades = get_user_trades(user_id)
     except Exception as e:
@@ -930,9 +918,8 @@ def my_trades(x_user_id: Optional[str] = Header(default=None)):
 # ── GET /trades/stats ─────────────────────────────────────────────────────────
 
 @router.get("/stats", response_model=TradeStats)
-def trade_stats(x_user_id: Optional[str] = Header(default=None)):
+def trade_stats(user_id: str = Depends(get_current_user)):
     """Return aggregated trading statistics for the authenticated user."""
-    user_id = _require_user(x_user_id)
     try:
         stats = get_trade_stats(user_id)
     except Exception as e:

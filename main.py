@@ -3,29 +3,39 @@ load_dotenv()  # must be before any imports that read env vars
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 import os
 
+from rate_limit import limiter
 from routes.trades import router as trades_router
 from routes.import_trades import router as import_router
 from routes.payments import router as payments_router
+from routes.waitlist import router as waitlist_router
 
 app = FastAPI(title="Tradfy API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# In production set ALLOWED_ORIGINS to your actual domain, e.g.:
+# ALLOWED_ORIGINS=https://edgejournal.in
+# For local dev the default includes localhost.
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        os.getenv("FRONTEND_URL", "http://localhost:3000"),
-        "http://localhost:3000",
-        "http://localhost:3001",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(trades_router)
 app.include_router(import_router)
 app.include_router(payments_router)
+app.include_router(waitlist_router)
 
 
 @app.get("/")

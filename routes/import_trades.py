@@ -1,9 +1,11 @@
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from typing import Optional
 
 from services.trade_parser import parse_broker_file
 from services.supabase_client import bulk_save_trades
 from models import Trade
+from auth import get_current_user
+from rate_limit import limiter
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 
@@ -11,17 +13,13 @@ SUPPORTED_BROKERS = {"zerodha", "upstox", "groww", "dhan"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
-def _require_user(x_user_id: Optional[str]) -> str:
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="X-User-Id header required")
-    return x_user_id
-
-
 @router.post("/import")
+@limiter.limit("10/minute")
 async def import_trades(
+    request: Request,
     file: UploadFile = File(...),
     broker: str = Form(...),
-    x_user_id: Optional[str] = Header(default=None),
+    user_id: str = Depends(get_current_user),
 ):
     """
     Import trades from a broker CSV/Excel export.
@@ -37,7 +35,6 @@ async def import_trades(
 
     Returns the count of imported trades and their IDs.
     """
-    user_id = _require_user(x_user_id)
 
     broker_lower = broker.strip().lower()
     if broker_lower not in SUPPORTED_BROKERS:
