@@ -165,7 +165,7 @@ Rules:
 """
 
 
-_SWING_FEEDBACK_PROMPT = """You are a trading coach giving honest, specific feedback to an Indian retail trader on a swing/positional trade. Speak like a knowledgeable friend — direct, plain English, no jargon.
+_SWING_FEEDBACK_PROMPT = """You are a trading coach reviewing an Indian retail trader's swing trade. Your job is to give honest, clear feedback in plain simple English — like a knowledgeable friend, not a finance textbook.
 
 Trade details:
 {trade_data}
@@ -179,32 +179,55 @@ Fundamental data:
 Trader's historical performance:
 {user_history}
 
-YOUR JOB: Pick the 3 most important things about THIS specific trade. Do not cover the same topics every time — look at the actual data and coach what matters most here.
+LANGUAGE RULES — follow strictly:
+- Write as if explaining to someone who has traded for 1 year but never studied finance
+- NO jargon: say "the stock was falling" not "bearish structure"; say "options lose value daily" not "theta decay"; say "overbought" is fine but explain it
+- Use ₹ numbers from the actual trade in every insight
+- Keep sentences short — max 20 words each
+- Give credit when the trade setup was actually good — not every trade is a mistake
 
-Choose 3 from this list based on what stands out most in the data:
-- Position size too large for the risk (use ₹ numbers from the trade)
-- Entry was chased — price was more than 3% above EMA-20 at entry
-- Trend was already broken — price below EMA-20 and EMA-50 at entry
-- Stock is thinly traded / micro-cap risk — hard to exit quickly
-- Fundamentals are stretched — high P/E, high debt, or low earnings
-- Trader's historical pattern — e.g. they consistently lose in this sector
-- Holding period risk — open too long relative to their avg winning trade
-- Good entry — price near EMA-20 support with trend intact (give credit when deserved)
-- Strong risk-reward — position sized well, clean stop level (give credit when deserved)
+YOUR JOB: Look at the data and pick the 3 most important things about THIS specific trade.
 
-RULES:
-- Give exactly 3 numbered insights
-- Title each insight in plain English like a friend: "You bought at the top of a broken trend" not "TREND STRUCTURE ANALYSIS"
-- Reference actual numbers from the trade data in every insight (₹ price, %, days, EMA levels)
-- If market context is available use those numbers; if not, work from entry price, sector, and history
-- Never say buy, sell, hold, or exit
-- After the 3 insights add exactly:
-  🔴 Key Mistake: [the single most important process error — one sentence, specific to this trade]
-  ✅ Do Better: [one concrete action for the next swing trade — measurable, not generic]
-- Under 180 words total
-- No bold, no caps titles, no markdown — plain text only
-- End with exactly: "Not investment advice. Decision is entirely yours."
-"""
+Choose 3 that matter most from:
+- Position too large (₹ amount at risk vs their average)
+- Entry was chased — bought too high above the 20-day moving average
+- Stock was already falling when they entered
+- Company fundamentals are weak — high debt or not making real profits
+- This stock is small and hard to sell quickly in a panic
+- Trader keeps losing in this sector (use their history if available)
+- Held too long — open longer than their usual winning trades
+- Good entry — price was near support, trend was intact (give credit)
+- Well-sized position — risk was controlled (give credit)
+
+Return ONLY a valid JSON object, no other text before or after:
+{{
+  "verdict": "HIGH RISK" or "BE CAREFUL" or "LOOKS CLEAN",
+  "summary": "One plain sentence — the single most important thing about this trade (max 15 words)",
+  "insights": [
+    {{
+      "severity": "critical" or "warning" or "positive",
+      "title": "Short plain English title, 6 words max, like talking to a friend",
+      "body": "2-3 short sentences. Use actual ₹ numbers and % from the trade. No jargon."
+    }},
+    {{
+      "severity": "critical" or "warning" or "positive",
+      "title": "...",
+      "body": "..."
+    }},
+    {{
+      "severity": "critical" or "warning" or "positive",
+      "title": "...",
+      "body": "..."
+    }}
+  ],
+  "key_mistake": "The single biggest mistake — one sentence, plain English, specific to this trade",
+  "do_better": "One concrete thing to do differently next time — simple and measurable"
+}}
+
+verdict guide:
+- HIGH RISK: position sizing problem, broken trend at entry, or fundamentals are very weak
+- BE CAREFUL: some concerns but not all bad — mixed signals
+- LOOKS CLEAN: good entry, reasonable size, trend was intact"""
 
 
 def extract_trades_from_screenshot(
@@ -540,8 +563,9 @@ def generate_swing_feedback(
     fundamentals: Optional[dict] = None,
 ) -> str:
     """
-    Generate analyst-grade coaching for equity_swing or futures_swing trades.
-    Incorporates live market context, fundamentals, and trader history.
+    Generate plain-English coaching for equity_swing or futures_swing trades.
+    Returns a JSON string with verdict, 3 insights with severity, key mistake, and do better.
+    Falls back to raw text if JSON parsing fails.
     """
     trade_summary = _build_trade_summary(trade_data)
     history_summary = _build_history_summary(user_history)
@@ -550,7 +574,7 @@ def generate_swing_feedback(
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=600,
+        max_tokens=800,
         messages=[
             {
                 "role": "user",
@@ -564,7 +588,25 @@ def generate_swing_feedback(
         ],
     )
 
-    return message.content[0].text.strip()
+    raw = message.content[0].text.strip()
+
+    # Strip markdown code fences if Claude wrapped the JSON
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    # Validate it's parseable JSON before storing — fallback to raw text if not
+    try:
+        parsed = json.loads(raw)
+        # Ensure required fields exist
+        if "verdict" in parsed and "insights" in parsed:
+            return json.dumps(parsed, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return raw
 
 
 _AUTOPSY_LOSS_PROMPT = """You are a post-trade analyst doing a forensic review of a losing trade for an Indian retail trader.
