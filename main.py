@@ -18,11 +18,11 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# In production set ALLOWED_ORIGINS to your actual domain, e.g.:
-# ALLOWED_ORIGINS=https://edgejournal.in
-# For local dev the default includes localhost.
-_raw_origins = os.getenv("ALLOWED_ORIGINS", "https://tradfy-frontend.vercel.app,http://localhost:3000,http://localhost:3001")
-ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+ALLOWED_ORIGINS = [
+    "https://tradfy-frontend.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
 
 app.add_middleware(
     CORSMiddleware,
