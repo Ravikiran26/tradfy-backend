@@ -1,9 +1,20 @@
 import os
-import jwt
 from fastapi import HTTPException, Header
 from typing import Optional
+from supabase import create_client
 
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+_supabase = None
+
+def _get_client():
+    global _supabase
+    if _supabase is None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
+        _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    return _supabase
 
 
 def get_current_user(authorization: Optional[str] = Header(default=None)) -> str:
@@ -17,25 +28,14 @@ def get_current_user(authorization: Optional[str] = Header(default=None)) -> str
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header required")
 
-    if not SUPABASE_JWT_SECRET:
-        raise RuntimeError(
-            "SUPABASE_JWT_SECRET environment variable is not set. "
-            "Find it in Supabase Dashboard → Project Settings → API → JWT Settings."
-        )
-
     token = authorization.removeprefix("Bearer ")
     try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token: missing user ID")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
+        client = _get_client()
+        response = client.auth.get_user(token)
+        if not response or not response.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return response.user.id
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
