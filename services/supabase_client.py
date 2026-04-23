@@ -445,6 +445,22 @@ def count_ai_analyses(user_id: str) -> int:
     return result.count or 0
 
 
+def is_user_pro(user_id: str) -> bool:
+    """Return True if the user has an active Pro subscription."""
+    try:
+        db = get_client()
+        result = (
+            db.table("users")
+            .select("is_pro")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+        return bool(result.data and result.data.get("is_pro"))
+    except Exception:
+        return False
+
+
 def get_expiry_stats(user_id: str) -> dict:
     """
     Compute expiry intelligence for options intraday trades:

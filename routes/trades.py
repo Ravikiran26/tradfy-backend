@@ -38,6 +38,7 @@ from services.supabase_client import (
     get_options_depth_stats,
     get_intraday_patterns,
     count_ai_analyses,
+    is_user_pro,
 )
 
 router = APIRouter(prefix="/trades", tags=["trades"])
@@ -121,6 +122,20 @@ async def upload_trade_screenshot(
     use it instead of the AI-detected type (e.g. options_scalping, options_positional).
     """
     image_bytes, media_type = await _read_image(file)
+
+    # ── AI usage gate ─────────────────────────────────────────────────────────
+    if not is_user_pro(user_id):
+        used = count_ai_analyses(user_id)
+        if used >= FREE_AI_LIMIT:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code":    "UPGRADE_REQUIRED",
+                    "message": f"You've used all {FREE_AI_LIMIT} free AI analyses. Upgrade to Pro for unlimited coaching.",
+                    "used":    used,
+                    "limit":   FREE_AI_LIMIT,
+                }
+            )
 
     # ── Extract all trades from screenshot ───────────────────────────────────
     try:
@@ -967,11 +982,12 @@ def weekly_report(user_id: str = Depends(get_current_user)):
 def get_usage(user_id: str = Depends(get_current_user)):
     """Return AI analysis usage count for the current user."""
     used = count_ai_analyses(user_id)
+    pro  = is_user_pro(user_id)
     return {
         "ai_analyses_used":  used,
         "ai_analyses_limit": FREE_AI_LIMIT,
-        "is_pro":            False,   # placeholder until payments are live
-        "can_generate":      used < FREE_AI_LIMIT,
+        "is_pro":            pro,
+        "can_generate":      pro or used < FREE_AI_LIMIT,
     }
 
 
@@ -992,9 +1008,9 @@ def generate_coaching(
     if not trade:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    # Gate: allow re-generating cached coaching for free; block new analyses over limit
+    # Gate: Pro users are unlimited; free users capped at FREE_AI_LIMIT
     already_has_coaching = bool(trade.get("ai_feedback"))
-    if not already_has_coaching:
+    if not already_has_coaching and not is_user_pro(user_id):
         used = count_ai_analyses(user_id)
         if used >= FREE_AI_LIMIT:
             raise HTTPException(
