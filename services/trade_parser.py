@@ -26,6 +26,24 @@ def _read_file_with_header_scan(file_bytes: bytes, filename: str) -> pd.DataFram
     return _read_file(file_bytes, filename)
 
 
+def _read_dhan_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    For Dhan P&L reports: scan for the row containing 'Security Name'
+    and use that as the header. Falls back to normal read for tradebook CSVs.
+    """
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        try:
+            df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            for i, row in df_raw.iterrows():
+                vals = [str(v).strip() for v in row if str(v).strip() not in ("", "nan")]
+                if "Security Name" in vals:
+                    return pd.read_excel(io.BytesIO(file_bytes), skiprows=i)
+        except Exception:
+            pass
+    return _read_file(file_bytes, filename)
+
+
 def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dict]:
     """
     Main entry point.
@@ -61,6 +79,11 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
     if broker_lower == "zerodha":
         df_smart = _read_file_with_header_scan(file_bytes, filename)
         return parse_zerodha(df_smart)
+
+    # For Dhan, find the row containing "Security Name" (P&L report has metadata before it)
+    if broker_lower == "dhan":
+        df_smart = _read_dhan_file(file_bytes, filename)
+        return parse_dhan(df_smart)
 
     return parsers[broker_lower](df)
 
@@ -684,17 +707,23 @@ def _parse_groww_transactions(df: pd.DataFrame) -> list[dict]:
 #   Trade No., Order No., Description, Buy/Sell, Qty, Price, Trade Value
 
 def parse_dhan(df: pd.DataFrame) -> list[dict]:
-    df = _norm_cols(df)
+    df_norm = _norm_cols(df)
 
-    sym_col    = _get_col(df, ["symbol", "scrip", "trading_symbol", "name"])
-    side_col   = _get_col(df, ["buy_sell", "side", "trade_type", "buysell", "b_s"])
-    qty_col    = _get_col(df, ["qty", "quantity"])
-    price_col  = _get_col(df, ["price", "trade_price"])
-    date_col   = _get_col(df, ["trade_date", "date", "order_date"])
-    series_col = _get_col(df, ["series", "segment", "instrument", "description"])
+    # Detect Dhan P&L report format (Security Name, Buy Qty., Avg. Buy Price, Realised P&L …)
+    pnl_indicators = {"security_name", "buy_qty_", "avg__buy_price", "realised_pl"}
+    if pnl_indicators & set(df_norm.columns):
+        return _parse_dhan_pnl(df_norm)
+
+    # Tradebook CSV format (individual buy/sell legs)
+    sym_col    = _get_col(df_norm, ["symbol", "scrip", "trading_symbol", "name"])
+    side_col   = _get_col(df_norm, ["buy_sell", "side", "trade_type", "buysell", "b_s"])
+    qty_col    = _get_col(df_norm, ["qty", "quantity"])
+    price_col  = _get_col(df_norm, ["price", "trade_price"])
+    date_col   = _get_col(df_norm, ["trade_date", "date", "order_date"])
+    series_col = _get_col(df_norm, ["series", "segment", "instrument", "description"])
 
     raw_legs: list[dict] = []
-    for _, row in df.iterrows():
+    for _, row in df_norm.iterrows():
         if not sym_col:
             continue
 
@@ -723,3 +752,92 @@ def parse_dhan(df: pd.DataFrame) -> list[dict]:
         })
 
     return _match_pairs(raw_legs)
+
+
+def _parse_dhan_pnl(df: pd.DataFrame) -> list[dict]:
+    """
+    Parse Dhan P&L Statement (PNL_REPORT.xls).
+    Columns: Sr., Security Name, ISIN, Buy Qty., Avg. Buy Price, Buy Value,
+             Sell Qty., Avg. Sell Price, Sell Value, Realised P&L, Realised P&L %,
+             Open Qty., Open Avg. Price, Closing Rate, Unrealised P&L, Unrealised P&L %
+    """
+    sym_col      = _get_col(df, ["security_name", "scrip_name", "symbol", "name"])
+    buy_qty_col  = _get_col(df, ["buy_qty_", "buy_qty", "buy_quantity"])
+    buy_px_col   = _get_col(df, ["avg__buy_price", "avg_buy_price", "buy_price"])
+    sell_qty_col = _get_col(df, ["sell_qty_", "sell_qty", "sell_quantity"])
+    sell_px_col  = _get_col(df, ["avg__sell_price", "avg_sell_price", "sell_price"])
+    pnl_col      = _get_col(df, ["realised_pl", "realised_pnl", "net_pnl"])
+    pnl_pct_col  = _get_col(df, ["realised_pl_", "realised_pl_pct"])
+    oqty_col     = _get_col(df, ["open_qty_", "open_qty", "open_quantity"])
+    opx_col      = _get_col(df, ["open_avg__price", "open_avg_price", "open_price"])
+
+    skip_names = {"equity", "futures and options", "commodities", "currency", "nan", ""}
+
+    trades: list[dict] = []
+    for _, row in df.iterrows():
+        if not sym_col:
+            continue
+
+        symbol = str(row.get(sym_col, "")).strip().upper()
+        if not symbol or symbol.lower() in skip_names:
+            continue
+
+        # Skip numeric-only rows (Sr. number only)
+        try:
+            float(symbol)
+            continue
+        except ValueError:
+            pass
+
+        buy_qty  = int(_clean_float(row.get(buy_qty_col))  or 0) if buy_qty_col  else 0
+        buy_px   = _clean_float(row.get(buy_px_col))              if buy_px_col   else None
+        sell_qty = int(_clean_float(row.get(sell_qty_col)) or 0) if sell_qty_col else 0
+        sell_px  = _clean_float(row.get(sell_px_col))             if sell_px_col  else None
+        pnl      = _clean_float(row.get(pnl_col))                 if pnl_col      else None
+        pnl_pct  = _clean_float(row.get(pnl_pct_col))             if pnl_pct_col  else None
+        oqty     = int(_clean_float(row.get(oqty_col))     or 0) if oqty_col     else 0
+        opx      = _clean_float(row.get(opx_col))                 if opx_col      else None
+
+        instrument_type = _detect_instrument(symbol)
+
+        if sell_qty > 0 and pnl is not None:
+            trades.append({
+                "symbol":          symbol,
+                "instrument_type": instrument_type,
+                "trade_type":      _detect_trade_type(instrument_type),
+                "action":          "buy",
+                "status":          "closed",
+                "quantity":        sell_qty,
+                "entry_price":     buy_px,
+                "exit_price":      sell_px,
+                "pnl":             round(pnl, 2),
+                "pnl_percent":     pnl_pct,
+                "trade_date":      None,
+                "closed_at":       None,
+                "holding_days":    None,
+                "broker":          "Dhan",
+                "sector":          None,
+                "ai_feedback":     None,
+            })
+
+        if oqty > 0:
+            trades.append({
+                "symbol":          symbol,
+                "instrument_type": instrument_type,
+                "trade_type":      _detect_trade_type(instrument_type),
+                "action":          "buy",
+                "status":          "open",
+                "quantity":        oqty,
+                "entry_price":     opx,
+                "exit_price":      None,
+                "pnl":             None,
+                "pnl_percent":     None,
+                "trade_date":      None,
+                "closed_at":       None,
+                "holding_days":    None,
+                "broker":          "Dhan",
+                "sector":          None,
+                "ai_feedback":     None,
+            })
+
+    return trades
