@@ -446,17 +446,25 @@ def count_ai_analyses(user_id: str) -> int:
 
 
 def is_user_pro(user_id: str) -> bool:
-    """Return True if the user has an active Pro subscription."""
+    """Return True if the user has an active, non-expired Pro subscription."""
     try:
+        from datetime import datetime, timezone
         db = get_client()
         result = (
             db.table("users")
-            .select("is_pro")
+            .select("is_pro, pro_expires_at")
             .eq("id", user_id)
             .single()
             .execute()
         )
-        return bool(result.data and result.data.get("is_pro"))
+        if not result.data or not result.data.get("is_pro"):
+            return False
+        expires_at = result.data.get("pro_expires_at")
+        if not expires_at:
+            # Legacy row: no expiry stored — honour it (grandfathered)
+            return True
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        return datetime.now(timezone.utc) < expiry
     except Exception:
         return False
 

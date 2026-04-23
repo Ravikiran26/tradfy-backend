@@ -2,6 +2,7 @@ import os
 import hmac
 import hashlib
 import razorpay
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from services.supabase_client import get_client as get_db
@@ -87,20 +88,24 @@ def verify_payment(
         raise HTTPException(status_code=400, detail="Invalid payment signature.")
 
     # Upgrade user to Pro in Supabase
+    now = datetime.now(timezone.utc)
+    expires = now + (timedelta(days=365) if body.plan == "yearly" else timedelta(days=30))
+
     db = get_db()
     try:
         db.table("users").upsert({
-            "id":         user_id,
-            "is_pro":     True,
-            "pro_plan":   body.plan,
-            "pro_since":  "now()",
+            "id":             user_id,
+            "is_pro":         True,
+            "pro_plan":       body.plan,
+            "pro_since":      now.isoformat(),
+            "pro_expires_at": expires.isoformat(),
         }).execute()
     except Exception:
-        # Fallback: try updating instead of upsert
         db.table("users").update({
-            "is_pro":    True,
-            "pro_plan":  body.plan,
-            "pro_since": "now()",
+            "is_pro":         True,
+            "pro_plan":       body.plan,
+            "pro_since":      now.isoformat(),
+            "pro_expires_at": expires.isoformat(),
         }).eq("id", user_id).execute()
 
     return {"success": True, "is_pro": True, "plan": body.plan}
