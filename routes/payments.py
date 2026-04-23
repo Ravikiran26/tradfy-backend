@@ -12,15 +12,13 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 
-# Pricing in paise (₹299 = 29900 paise)
-EARLY_BIRD_MONTHLY_PAISE = 29900   # ₹299/mo
-EARLY_BIRD_YEARLY_PAISE  = 249900  # ₹2,499/yr
-REGULAR_MONTHLY_PAISE    = 49900   # ₹499/mo
-REGULAR_YEARLY_PAISE     = 349900  # ₹3,499/yr
+# Pricing in paise
+PRO_MONTHLY_PAISE = 49900   # ₹499/mo
+PRO_YEARLY_PAISE  = 349900  # ₹3,499/yr
 
 PLAN_AMOUNTS = {
-    "monthly": EARLY_BIRD_MONTHLY_PAISE,
-    "yearly":  EARLY_BIRD_YEARLY_PAISE,
+    "monthly": PRO_MONTHLY_PAISE,
+    "yearly":  PRO_YEARLY_PAISE,
 }
 
 
