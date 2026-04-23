@@ -19,6 +19,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
+    "https://tradersdiary.in",
+    "https://www.tradersdiary.in",
     "https://tradfy-frontend.vercel.app",
     "http://localhost:3000",
     "http://localhost:3001",
