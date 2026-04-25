@@ -3,7 +3,7 @@ import hmac
 import hashlib
 import razorpay
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from services.supabase_client import get_client as get_db
 from auth import get_current_user
@@ -109,6 +109,57 @@ def verify_payment(
         }).eq("id", user_id).execute()
 
     return {"success": True, "is_pro": True, "plan": body.plan}
+
+
+# ── POST /payments/webhook ───────────────────────────────────────────────────
+# Razorpay calls this server-side on payment.captured — backup to /verify
+
+@router.post("/webhook")
+async def razorpay_webhook(request: Request):
+    body_bytes = await request.body()
+    sig = request.headers.get("X-Razorpay-Signature", "")
+    webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
+
+    if webhook_secret:
+        expected = hmac.new(
+            webhook_secret.encode("utf-8"),
+            body_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    import json
+    payload = json.loads(body_bytes)
+    event = payload.get("event")
+
+    if event == "payment.captured":
+        payment = payload["payload"]["payment"]["entity"]
+        notes   = payment.get("notes", {})
+        user_id = notes.get("user_id")
+        plan    = notes.get("plan", "monthly")
+
+        if user_id:
+            now     = datetime.now(timezone.utc)
+            expires = now + (timedelta(days=365) if plan == "yearly" else timedelta(days=30))
+            db = get_db()
+            try:
+                db.table("users").upsert({
+                    "id":             user_id,
+                    "is_pro":         True,
+                    "pro_plan":       plan,
+                    "pro_since":      now.isoformat(),
+                    "pro_expires_at": expires.isoformat(),
+                }).execute()
+            except Exception:
+                db.table("users").update({
+                    "is_pro":         True,
+                    "pro_plan":       plan,
+                    "pro_since":      now.isoformat(),
+                    "pro_expires_at": expires.isoformat(),
+                }).eq("id", user_id).execute()
+
+    return {"status": "ok"}
 
 
 # ── GET /payments/status ──────────────────────────────────────────────────────
