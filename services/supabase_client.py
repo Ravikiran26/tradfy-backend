@@ -448,11 +448,12 @@ def count_ai_analyses(user_id: str) -> int:
 def is_user_pro(user_id: str) -> bool:
     """Return True if the user has an active, non-expired Pro subscription."""
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
+        from services.email import send_renewal_reminder, send_pro_expired
         db = get_client()
         result = (
             db.table("users")
-            .select("is_pro, pro_expires_at")
+            .select("is_pro, pro_expires_at, reminder_sent")
             .eq("id", user_id)
             .single()
             .execute()
@@ -461,10 +462,43 @@ def is_user_pro(user_id: str) -> bool:
             return False
         expires_at = result.data.get("pro_expires_at")
         if not expires_at:
-            # Legacy row: no expiry stored — honour it (grandfathered)
-            return True
+            return True  # Legacy row — grandfathered
+        now    = datetime.now(timezone.utc)
         expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-        return datetime.now(timezone.utc) < expiry
+        days_left = (expiry - now).days
+
+        if now >= expiry:
+            # Expired — mark as not pro and send expiry email once
+            db.table("users").update({"is_pro": False, "reminder_sent": False}).eq("id", user_id).execute()
+            try:
+                auth_user = db.auth.admin.get_user_by_id(user_id)
+                if auth_user and auth_user.user:
+                    u = auth_user.user
+                    send_pro_expired(
+                        email=u.email,
+                        name=u.user_metadata.get("full_name", "") if u.user_metadata else "",
+                    )
+            except Exception:
+                pass
+            return False
+
+        # Send 7-day reminder once
+        if days_left <= 7 and not result.data.get("reminder_sent"):
+            db.table("users").update({"reminder_sent": True}).eq("id", user_id).execute()
+            try:
+                auth_user = db.auth.admin.get_user_by_id(user_id)
+                if auth_user and auth_user.user:
+                    u = auth_user.user
+                    send_renewal_reminder(
+                        email=u.email,
+                        name=u.user_metadata.get("full_name", "") if u.user_metadata else "",
+                        expires_at=expiry.strftime("%d %b %Y"),
+                        days_left=days_left,
+                    )
+            except Exception:
+                pass
+
+        return True
     except Exception:
         return False
 

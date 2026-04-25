@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from services.supabase_client import get_client as get_db
+from services.email import send_payment_confirmation
 from auth import get_current_user
 
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -108,6 +109,19 @@ def verify_payment(
             "pro_expires_at": expires.isoformat(),
         }).eq("id", user_id).execute()
 
+    # Send confirmation email
+    try:
+        auth_user = db.auth.admin.get_user_by_id(user_id)
+        if auth_user and auth_user.user:
+            u = auth_user.user
+            send_payment_confirmation(
+                email=u.email,
+                name=u.user_metadata.get("full_name", "") if u.user_metadata else "",
+                expires_at=expires.strftime("%d %b %Y"),
+            )
+    except Exception:
+        pass
+
     return {"success": True, "is_pro": True, "plan": body.plan}
 
 
@@ -167,12 +181,13 @@ async def razorpay_webhook(request: Request):
 @router.get("/status")
 def payment_status(user_id: str = Depends(get_current_user)):
     db = get_db()
-    result = db.table("users").select("is_pro, pro_plan, pro_since").eq("id", user_id).execute()
+    result = db.table("users").select("is_pro, pro_plan, pro_since, pro_expires_at").eq("id", user_id).execute()
     if result.data:
         row = result.data[0]
         return {
-            "is_pro":    row.get("is_pro", False),
-            "pro_plan":  row.get("pro_plan"),
-            "pro_since": row.get("pro_since"),
+            "is_pro":         row.get("is_pro", False),
+            "pro_plan":       row.get("pro_plan"),
+            "pro_since":      row.get("pro_since"),
+            "pro_expires_at": row.get("pro_expires_at"),
         }
-    return {"is_pro": False, "pro_plan": None, "pro_since": None}
+    return {"is_pro": False, "pro_plan": None, "pro_since": None, "pro_expires_at": None}
