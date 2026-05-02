@@ -723,3 +723,55 @@ def generate_trade_autopsy(trade_data: dict, market_context: Optional[dict] = No
         ],
     )
     return message.content[0].text.strip()
+
+
+_WEEKLY_COACH_PROMPT = """You are a trading psychologist and performance analyst reviewing an Indian retail trader's complete data. Be direct and specific — use their actual numbers in every point.
+
+Trader summary:
+{trader_data}
+
+Return ONLY a valid JSON object, no other text before or after:
+{{
+  "mistakes": [
+    {{"title": "6 words max, plain English", "body": "2 sentences using their actual ₹ numbers or %"}},
+    {{"title": "...", "body": "..."}},
+    {{"title": "...", "body": "..."}}
+  ],
+  "rules": [
+    "Concrete rule for next week — specific and measurable",
+    "Concrete rule for next week — specific and measurable",
+    "Concrete rule for next week — specific and measurable"
+  ],
+  "do_not_trade": "One specific scenario to avoid based on their data — reference an actual number (e.g. Do not trade on Mondays — your Monday win rate is 28%)"
+}}
+
+Pick the 3 most damaging patterns for mistakes. Rules must be actionable (e.g. Stop after 2 losses in a day — not be more disciplined). Do-not-trade must reference a specific pattern from their numbers.
+⚠️ Not investment advice."""
+
+
+def generate_weekly_coach(trader_data: str) -> dict:
+    """
+    Send the trader's aggregated pattern data to Claude.
+    Returns dict with mistakes (list), rules (list), do_not_trade (str).
+    """
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=700,
+        messages=[{"role": "user", "content": _WEEKLY_COACH_PROMPT.format(trader_data=trader_data)}],
+    )
+
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        parsed = json.loads(raw)
+        if "mistakes" in parsed and "rules" in parsed and "do_not_trade" in parsed:
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    return {"mistakes": [], "rules": [], "do_not_trade": raw}

@@ -20,6 +20,7 @@ from services.claude import (
     generate_swing_feedback,
     generate_session_feedback,
     generate_trade_autopsy,
+    generate_weekly_coach,
 )
 from services.supabase_client import (
     save_trade,
@@ -974,6 +975,120 @@ def weekly_report(user_id: str = Depends(get_current_user)):
         "win_rate_change": round(this_week["win_rate"] - last_week["win_rate"], 1),
         "focus": focus,
     }
+
+
+# ── GET /trades/ai-coach ──────────────────────────────────────────────────────
+
+MIN_COACH_TRADES = 15
+
+@router.get("/ai-coach")
+def ai_coach(user_id: str = Depends(get_current_user)):
+    """
+    Generate a weekly AI coaching report: 3 mistakes, 3 rules, 1 do-not-trade warning.
+    Requires 15+ closed trades. Result cached in users table for 7 days.
+    """
+    import json as _json
+    from services.supabase_client import get_client as get_db
+
+    trades = get_user_trades(user_id)
+    closed = [t for t in trades if t.get("pnl") is not None and t.get("status") != "open"]
+
+    if len(closed) < MIN_COACH_TRADES:
+        return {"ready": False, "closed_count": len(closed), "min_trades": MIN_COACH_TRADES}
+
+    # ── Check cache (7-day TTL) ──────────────────────────────────────────────
+    db = get_db()
+    try:
+        cache_row = (
+            db.table("users")
+            .select("ai_coach_cache, ai_coach_generated_at")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+        if cache_row.data:
+            cached     = cache_row.data.get("ai_coach_cache")
+            generated  = cache_row.data.get("ai_coach_generated_at")
+            if cached and generated:
+                age = datetime.now(timezone.utc) - datetime.fromisoformat(
+                    generated.replace("Z", "+00:00")
+                )
+                if age.days < 7:
+                    return {"ready": True, **_json.loads(cached)}
+    except Exception:
+        pass
+
+    # ── Build trader data summary ────────────────────────────────────────────
+    wins   = [t for t in closed if (t.get("pnl") or 0) > 0]
+    losses = [t for t in closed if (t.get("pnl") or 0) < 0]
+    win_rate  = round(len(wins) / len(closed) * 100, 1)
+    avg_win   = round(sum(t["pnl"] for t in wins)   / len(wins),   0) if wins   else 0
+    avg_loss  = round(sum(t["pnl"] for t in losses) / len(losses), 0) if losses else 0
+    total_pnl = round(sum(t["pnl"] for t in closed), 0)
+
+    lines = [
+        f"Total closed trades: {len(closed)}",
+        f"Overall P&L: ₹{total_pnl:,.0f}",
+        f"Win rate: {win_rate}%",
+        f"Avg winning trade: ₹{avg_win:,.0f}",
+        f"Avg losing trade: ₹{avg_loss:,.0f}",
+    ]
+
+    # Overtrading buckets
+    intraday = get_intraday_patterns(user_id)
+    for bucket, stats in (intraday.get("overtrading") or {}).items():
+        if stats:
+            lines.append(
+                f"When trading {bucket}: win rate {stats['win_rate']}%, avg P&L ₹{stats['avg_pnl']:,.0f}"
+            )
+
+    # Revenge trading
+    revenge = intraday.get("revenge_trading")
+    if revenge:
+        lines.append(
+            f"After-loss trades: {revenge.get('revenge_count', 0)} detected, "
+            f"win rate {revenge.get('revenge_win_rate', 0)}% "
+            f"(vs normal {revenge.get('normal_win_rate', 0)}%)"
+        )
+
+    # Best/worst day
+    expiry    = get_expiry_stats(user_id)
+    day_stats = expiry.get("day_stats", {})
+    best_day  = expiry.get("best_day")
+    worst_day = expiry.get("worst_day")
+    if best_day and best_day in day_stats:
+        s = day_stats[best_day]
+        lines.append(f"Best day: {best_day} — {s['win_rate']}% win rate, avg ₹{s['avg_pnl']:,.0f}")
+    if worst_day and worst_day in day_stats:
+        s = day_stats[worst_day]
+        lines.append(f"Worst day: {worst_day} — {s['win_rate']}% win rate, avg ₹{s['avg_pnl']:,.0f}")
+
+    # Best underlying (NIFTY / BANKNIFTY / SENSEX)
+    for name, stats in sorted(
+        (intraday.get("best_underlying") or {}).items(),
+        key=lambda x: x[1].get("avg_pnl", 0),
+        reverse=True,
+    )[:3]:
+        lines.append(
+            f"{name}: {stats.get('win_rate', 0)}% win rate, avg ₹{stats.get('avg_pnl', 0):,.0f}"
+        )
+
+    trader_data = "\n".join(lines)
+
+    # ── Call Claude ──────────────────────────────────────────────────────────
+    result = generate_weekly_coach(trader_data)
+
+    # ── Cache result ─────────────────────────────────────────────────────────
+    try:
+        db.table("users").upsert({
+            "id":                      user_id,
+            "ai_coach_cache":          _json.dumps(result, ensure_ascii=False),
+            "ai_coach_generated_at":   datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception:
+        pass
+
+    return {"ready": True, **result}
 
 
 # ── GET /trades/usage ─────────────────────────────────────────────────────────
