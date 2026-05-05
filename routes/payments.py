@@ -134,14 +134,16 @@ async def razorpay_webhook(request: Request):
     sig = request.headers.get("X-Razorpay-Signature", "")
     webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 
-    if webhook_secret:
-        expected = hmac.new(
-            webhook_secret.encode("utf-8"),
-            body_bytes,
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(expected, sig):
-            raise HTTPException(status_code=400, detail="Invalid webhook signature")
+    if not webhook_secret:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+
+    expected = hmac.new(
+        webhook_secret.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
     import json
     payload = json.loads(body_bytes)
