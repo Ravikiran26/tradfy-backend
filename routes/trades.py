@@ -808,7 +808,7 @@ def trade_fundamentals(
     return data
 
 
-FREE_AI_LIMIT = 50  # free AI analyses per user on the free tier
+FREE_AI_LIMIT = 10  # free AI analyses per user on the free tier
 
 
 # ── GET /trades/streak ────────────────────────────────────────────────────────
