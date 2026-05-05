@@ -1,5 +1,5 @@
 """
-Broker CSV/Excel import parsers for Zerodha, Upstox, Groww, and Dhan.
+Broker CSV/Excel import parsers for Zerodha, Upstox, Groww, Dhan, and Angel One.
 
 Each parser returns a list of trade dicts ready for bulk DB insert.
 Tradebook formats (individual buy/sell legs) are FIFO-matched into closed trades.
@@ -11,7 +11,7 @@ import re
 import pandas as pd
 from datetime import date, datetime
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, List
 
 
 # ── File loading ──────────────────────────────────────────────────────────────
@@ -44,31 +44,132 @@ def _read_dhan_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return _read_file(file_bytes, filename)
 
 
+def _read_angelone_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Angel One P&L/Net-position reports have several metadata rows before the real header.
+    Scan for a row that contains known Angel One column keywords and use it as the header.
+    Falls back to plain read (for tradebook CSVs).
+    """
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        try:
+            df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None)
+            for i, row in df_raw.iterrows():
+                vals = [str(v).strip().lower() for v in row if str(v).strip() not in ("", "nan")]
+                # Match Angel One P&L header row keywords
+                if any(k in vals for k in ("net instrument", "scrip name", "symbol", "script name")):
+                    if any(k in vals for k in ("buy qty", "sell qty", "net p&l", "p&l", "buy rate", "sell rate")):
+                        return pd.read_excel(io.BytesIO(file_bytes), skiprows=i)
+        except Exception:
+            pass
+    return _read_file(file_bytes, filename)
+
+
+def parse_generic_csv(df: pd.DataFrame) -> list[dict]:
+    """
+    Fallback parser for unknown brokers.
+    Sends column names + sample rows to Claude, gets back a field mapping,
+    then normalizes every row into our standard trade dict.
+    """
+    from services.claude import infer_csv_mapping
+
+    columns = [str(c) for c in df.columns.tolist()]
+    sample_rows = df.head(3).fillna("").astype(str).to_dict(orient="records")
+
+    mapping = infer_csv_mapping(columns, sample_rows)
+    if not mapping:
+        raise ValueError("Could not determine column mapping for this CSV. Please select your broker manually.")
+
+    # Invert: standard_field -> original_col (skip nulls)
+    field_to_col = {v: k for k, v in mapping.items() if v}
+
+    def get(row, field):
+        col = field_to_col.get(field)
+        return row.get(col) if col else None
+
+    def safe_float(val):
+        try:
+            return float(str(val).replace(",", "").replace("₹", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    def parse_date(val) -> Optional[str]:
+        if not val:
+            return None
+        for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d %b %Y", "%d-%b-%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(str(val).strip(), fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return None
+
+    trades = []
+    for _, row in df.iterrows():
+        symbol = get(row, "symbol")
+        if not symbol or str(symbol).strip() in ("", "nan", "None"):
+            continue
+
+        action_raw = str(get(row, "action") or "").lower().strip()
+        action = "buy" if action_raw in ("buy", "b", "purchase") else "sell" if action_raw in ("sell", "s") else None
+
+        pnl = safe_float(get(row, "pnl"))
+        entry = safe_float(get(row, "entry_price"))
+        exit_ = safe_float(get(row, "exit_price"))
+        qty = safe_float(get(row, "quantity"))
+        trade_date = parse_date(get(row, "trade_date"))
+
+        # Infer instrument type from symbol
+        sym_upper = str(symbol).upper()
+        if sym_upper.endswith("CE") or sym_upper.endswith("PE"):
+            instrument_type = "options"
+        elif "FUT" in sym_upper:
+            instrument_type = "futures"
+        else:
+            instrument_type = "equity"
+
+        trades.append({
+            "symbol":          str(symbol).strip().upper(),
+            "instrument_type": instrument_type,
+            "action":          action,
+            "quantity":        int(qty) if qty is not None else None,
+            "entry_price":     entry,
+            "exit_price":      exit_,
+            "pnl":             pnl,
+            "pnl_percent":     safe_float(get(row, "pnl_percent")),
+            "trade_date":      trade_date,
+            "trade_time":      str(get(row, "trade_time") or "").strip() or None,
+            "status":          "closed" if pnl is not None else "open",
+            "broker":          str(get(row, "broker") or "Unknown").strip(),
+        })
+
+    return trades
+
+
 def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dict]:
     """
     Main entry point.
-    broker: 'zerodha' | 'upstox' | 'groww' | 'dhan' (case-insensitive)
+    broker: 'zerodha' | 'upstox' | 'groww' | 'dhan' | 'angelone' | 'auto' (case-insensitive)
     Returns list of trade dicts ready for DB insert (no user_id yet).
     """
     df = _read_file(file_bytes, filename)
 
     broker_lower = broker.lower().strip()
     parsers = {
-        "zerodha": parse_zerodha,
-        "upstox":  parse_upstox,
-        "groww":   parse_groww,
-        "dhan":    parse_dhan,
+        "zerodha":   parse_zerodha,
+        "upstox":    parse_upstox,
+        "groww":     parse_groww,
+        "dhan":      parse_dhan,
+        "angelone":  parse_angelone,
     }
 
     if broker_lower not in parsers:
-        # Try auto-detect before raising
+        # Try auto-detect from column names
         detected = _detect_broker(df)
         if detected:
             broker_lower = detected
         else:
-            raise ValueError(
-                f"Unknown broker '{broker}'. Supported: zerodha, upstox, groww, dhan"
-            )
+            # Fall back to AI-powered generic parser
+            return parse_generic_csv(df)
 
     # For Upstox, try P&L format first (files with metadata header rows)
     if broker_lower == "upstox":
@@ -84,6 +185,11 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
     if broker_lower == "dhan":
         df_smart = _read_dhan_file(file_bytes, filename)
         return parse_dhan(df_smart)
+
+    # For Angel One, scan past metadata rows to find the real header
+    if broker_lower == "angelone":
+        df_smart = _read_angelone_file(file_bytes, filename)
+        return parse_angelone(df_smart)
 
     return parsers[broker_lower](df)
 
@@ -140,6 +246,10 @@ def _detect_broker(df: pd.DataFrame) -> Optional[str]:
         "description" in cols_raw and "series" in cols_raw
     ):
         return "dhan"
+    if "net instrument" in cols_raw or (
+        "buy rate" in cols_raw and "sell rate" in cols_raw and "net p&l" in cols_raw
+    ):
+        return "angelone"
     return None
 
 
@@ -841,3 +951,170 @@ def _parse_dhan_pnl(df: pd.DataFrame) -> list[dict]:
             })
 
     return trades
+
+
+# ── Angel One ─────────────────────────────────────────────────────────────────
+#
+# Two report formats available from Angel One Smart Back Office:
+#
+# (A) Net Position / P&L Statement (Excel) — most useful:
+#   Net Instrument | Buy Qty | Buy Rate | Sell Qty | Sell Rate | Buy Value | Sell Value | Net P&L
+#   -- OR older back-office --
+#   Scrip Name | Qty | Buy Avg | Sell Avg | Buy Value | Sell Value | P&L
+#
+# (B) Trade Book CSV (individual legs):
+#   Symbol | Exchange | Segment | Trade Date | Trade Time | Buy/Sell | Qty | Price | Order No
+
+
+def parse_angelone(df: pd.DataFrame) -> list[dict]:
+    df_norm = _norm_cols(df)
+
+    # Detect P&L / Net Position format
+    pnl_indicators = {
+        "net_p_l", "net_pl", "p_l", "realized_p_l", "realised_p_l",
+        "net_p&l", "buy_rate", "sell_rate", "buy_avg", "sell_avg",
+        "avg_buy_price", "avg_sell_price",
+    }
+    if pnl_indicators & set(df_norm.columns):
+        return _parse_angelone_pnl(df_norm)
+
+    # Fall back to trade book (individual buy/sell legs)
+    return _parse_angelone_tradebook(df_norm)
+
+
+def _parse_angelone_pnl(df: pd.DataFrame) -> list[dict]:
+    """
+    Angel One Net Position / P&L Statement.
+    Handles both newer 'Net Instrument' format and older 'Scrip Name' format.
+    """
+    sym_col      = _get_col(df, ["net_instrument", "scrip_name", "script_name", "symbol", "instrument", "name"])
+    buy_qty_col  = _get_col(df, ["buy_qty", "buy_quantity"])
+    buy_px_col   = _get_col(df, ["buy_rate", "buy_avg", "avg_buy_price", "avg__buy_price"])
+    sell_qty_col = _get_col(df, ["sell_qty", "sell_quantity"])
+    sell_px_col  = _get_col(df, ["sell_rate", "sell_avg", "avg_sell_price", "avg__sell_price"])
+    pnl_col      = _get_col(df, ["net_p_l", "net_pl", "p_l", "realized_p_l", "realised_p_l", "net_p&l", "pnl"])
+    buy_date_col = _get_col(df, ["buy_date", "date", "trade_date"])
+    sell_date_col = _get_col(df, ["sell_date"])
+    oqty_col     = _get_col(df, ["open_qty", "net_qty", "open_quantity"])
+    opx_col      = _get_col(df, ["open_avg", "open_price", "closing_rate", "ltp"])
+
+    trades: list[dict] = []
+
+    for _, row in df.iterrows():
+        if not sym_col:
+            continue
+
+        symbol = str(row.get(sym_col, "")).strip().upper()
+        if not symbol or symbol in ("NAN", "", "NET INSTRUMENT", "SCRIP NAME", "SYMBOL"):
+            continue
+
+        # Skip pure-number rows (serial numbers)
+        try:
+            float(symbol)
+            continue
+        except ValueError:
+            pass
+
+        buy_qty  = int(_clean_float(row.get(buy_qty_col))  or 0) if buy_qty_col  else 0
+        buy_px   = _clean_float(row.get(buy_px_col))              if buy_px_col   else None
+        sell_qty = int(_clean_float(row.get(sell_qty_col)) or 0) if sell_qty_col else 0
+        sell_px  = _clean_float(row.get(sell_px_col))             if sell_px_col  else None
+        pnl      = _clean_float(row.get(pnl_col))                 if pnl_col      else None
+        buy_date = _parse_date(row.get(buy_date_col))             if buy_date_col else None
+        sell_date = _parse_date(row.get(sell_date_col))           if sell_date_col else None
+        oqty     = int(_clean_float(row.get(oqty_col))     or 0) if oqty_col     else 0
+        opx      = _clean_float(row.get(opx_col))                 if opx_col      else None
+
+        instrument_type = _detect_instrument(symbol)
+        qty = sell_qty or buy_qty
+
+        pnl_percent = None
+        if pnl is not None and buy_px and qty:
+            cost = buy_px * qty
+            pnl_percent = round(pnl / cost * 100, 4) if cost else 0.0
+
+        if sell_qty > 0 and pnl is not None:
+            trades.append({
+                "symbol":          symbol,
+                "instrument_type": instrument_type,
+                "trade_type":      _detect_trade_type(instrument_type),
+                "action":          "buy",
+                "status":          "closed",
+                "quantity":        sell_qty,
+                "entry_price":     buy_px,
+                "exit_price":      sell_px,
+                "pnl":             round(pnl, 2),
+                "pnl_percent":     pnl_percent,
+                "trade_date":      str(buy_date) if buy_date else None,
+                "closed_at":       str(sell_date) if sell_date else None,
+                "holding_days":    (sell_date - buy_date).days if buy_date and sell_date else None,
+                "broker":          "Angel One",
+                "sector":          None,
+                "ai_feedback":     None,
+            })
+
+        if oqty > 0:
+            trades.append({
+                "symbol":          symbol,
+                "instrument_type": instrument_type,
+                "trade_type":      _detect_trade_type(instrument_type),
+                "action":          "buy",
+                "status":          "open",
+                "quantity":        oqty,
+                "entry_price":     opx,
+                "exit_price":      None,
+                "pnl":             None,
+                "pnl_percent":     None,
+                "trade_date":      str(buy_date) if buy_date else None,
+                "closed_at":       None,
+                "holding_days":    None,
+                "broker":          "Angel One",
+                "sector":          None,
+                "ai_feedback":     None,
+            })
+
+    return trades
+
+
+def _parse_angelone_tradebook(df: pd.DataFrame) -> list[dict]:
+    """
+    Angel One Trade Book CSV (individual buy/sell legs).
+    Columns: Symbol, Exchange, Segment, Trade Date, Trade Time, Buy/Sell, Qty, Price
+    """
+    sym_col   = _get_col(df, ["symbol", "scrip_name", "script_name", "net_instrument", "instrument"])
+    side_col  = _get_col(df, ["buy_sell", "buysell", "b_s", "side", "trade_type", "transaction_type"])
+    qty_col   = _get_col(df, ["qty", "quantity", "trade_qty"])
+    price_col = _get_col(df, ["price", "trade_price", "avg_price", "rate"])
+    date_col  = _get_col(df, ["trade_date", "date", "order_date", "execution_date"])
+    seg_col   = _get_col(df, ["segment", "series", "exchange", "instrument_type"])
+
+    raw_legs: list[dict] = []
+    for _, row in df.iterrows():
+        if not sym_col:
+            continue
+
+        symbol = str(row.get(sym_col, "")).strip().upper()
+        if not symbol or symbol in ("NAN", ""):
+            continue
+
+        side   = str(row.get(side_col, "")).strip().upper() if side_col else "B"
+        action = "buy" if side.startswith("B") else "sell"
+
+        segment         = str(row.get(seg_col, "")).upper() if seg_col else ""
+        instrument_type = _detect_instrument(symbol, segment)
+
+        qty = int(_clean_float(row.get(qty_col)) or 0) if qty_col else 0
+        if qty <= 0:
+            continue
+
+        raw_legs.append({
+            "symbol":          symbol,
+            "instrument_type": instrument_type,
+            "action":          action,
+            "quantity":        qty,
+            "entry_price":     _clean_float(row.get(price_col)) if price_col else None,
+            "trade_date":      _parse_date(row.get(date_col)) if date_col else None,
+            "broker":          "Angel One",
+        })
+
+    return _match_pairs(raw_legs)

@@ -2,7 +2,7 @@ import anthropic
 import base64
 import json
 import os
-from typing import Optional
+from typing import Optional, List
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -775,3 +775,68 @@ def generate_weekly_coach(trader_data: str) -> dict:
         pass
 
     return {"mistakes": [], "rules": [], "do_not_trade": raw}
+
+
+_CSV_MAPPING_PROMPT = """You are a trade data normalizer for Indian stock brokers.
+
+I have a CSV file from an unknown broker with these column names:
+{columns}
+
+Here are {n_samples} sample rows (as JSON):
+{sample_rows}
+
+Map each column to one of these standard fields (use null if no match):
+- symbol       : stock/contract name (e.g. RELIANCE, NIFTY22600CE, BANKNIFTY FUT)
+- action       : buy or sell
+- instrument_type : equity | futures | options
+- quantity     : number of shares or lots
+- entry_price  : buy price / avg buy price
+- exit_price   : sell price / avg sell price
+- pnl          : realized profit or loss in INR (positive = profit)
+- pnl_percent  : P&L as a percentage
+- trade_date   : date of trade (entry date)
+- trade_time   : time of trade if available
+- broker       : broker name if present in data
+
+Return ONLY a JSON object like this — no explanation, no markdown:
+{{
+  "original_column_name": "standard_field_or_null",
+  ...one entry per column...
+}}
+
+Rules:
+- Only map columns you are confident about
+- Use null for columns that don't match any standard field (e.g. order ID, ISIN, exchange)
+- For action column: values like BUY/B/buy map to "action", values SELL/S/sell also map to "action"
+- If buy price and sell price are separate columns, map both to entry_price and exit_price respectively
+- pnl may be labelled as: P&L, Profit/Loss, Realised P&L, Net P&L, PnL, Gain/Loss"""
+
+
+def infer_csv_mapping(columns: List[str], sample_rows: List[dict]) -> dict:
+    """
+    Ask Claude to map unknown broker CSV columns to our standard trade fields.
+    Returns dict of {original_col: standard_field_or_null}.
+    """
+    prompt = _CSV_MAPPING_PROMPT.format(
+        columns=", ".join(columns),
+        n_samples=len(sample_rows),
+        sample_rows=json.dumps(sample_rows, ensure_ascii=False, default=str),
+    )
+
+    message = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
