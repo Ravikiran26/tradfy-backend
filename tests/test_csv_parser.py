@@ -2,9 +2,12 @@
 Tests for broker CSV parsers and the AI-powered generic CSV fallback.
 
 Covered:
+- _detect_instrument: equity / options / futures for all symbol patterns
 - _detect_broker: recognises Zerodha/Upstox/Dhan/Angel One/Groww columns
-- parse_zerodha / parse_upstox / parse_dhan: basic row normalization
-- parse_generic_csv: full flow with mocked infer_csv_mapping (no real API call)
+- parse_zerodha tradebook: equity swing, F&O options, futures (FIFO-matched pairs)
+- parse_upstox P&L: options, equity
+- parse_dhan P&L: options, equity, futures
+- parse_generic_csv: full flow with mocked Claude (no real API call)
 - parse_broker_file: routes correctly, falls through to generic on unknown broker
 """
 
@@ -20,9 +23,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from services.trade_parser import (
     _detect_broker,
+    _detect_instrument,
+    parse_zerodha,
     parse_generic_csv,
     parse_broker_file,
     _read_file,
+    _norm_cols,
 )
 
 
@@ -241,3 +247,236 @@ class TestParseBrokerFileRouting:
             except Exception:
                 pass  # parsing may fail on incomplete data — what matters is Claude wasn't called
             mock_claude.assert_not_called()
+
+
+# ── _detect_instrument ────────────────────────────────────────────────────────
+
+class TestDetectInstrument:
+
+    # Equity — stock names that contain CE/PE letters must NOT be options
+    def test_reliance_is_equity(self):
+        assert _detect_instrument("RELIANCE") == "equity"
+
+    def test_persistent_is_equity(self):
+        # PERSISTENT contains "PE" and "SISTE" — should not be options
+        assert _detect_instrument("PERSISTENT") == "equity"
+
+    def test_price_like_symbols_are_equity(self):
+        assert _detect_instrument("PRICOL") == "equity"
+
+    # Options — must have digit before CE/PE
+    def test_nifty_call_option(self):
+        assert _detect_instrument("NIFTY22600CE") == "options"
+
+    def test_nifty_put_option(self):
+        assert _detect_instrument("NIFTY22400PE") == "options"
+
+    def test_banknifty_option(self):
+        assert _detect_instrument("BANKNIFTY48000CE") == "options"
+
+    def test_sensex_option(self):
+        assert _detect_instrument("SENSEX75300PE") == "options"
+
+    # Options via extra/segment field
+    def test_extra_ce_segment(self):
+        assert _detect_instrument("NIFTY", "CE") == "options"
+
+    def test_extra_pe_segment(self):
+        assert _detect_instrument("BANKNIFTY", "PE") == "options"
+
+    def test_extra_opt_segment(self):
+        assert _detect_instrument("NIFTY", "OPT") == "options"
+
+    # Futures
+    def test_banknifty_future(self):
+        assert _detect_instrument("BANKNIFTYFUT") == "futures"
+
+    def test_fut_in_symbol(self):
+        assert _detect_instrument("NIFTY 27 MAR FUT") == "futures"
+
+    def test_extra_fut_segment(self):
+        assert _detect_instrument("NIFTY", "FUT") == "futures"
+
+
+# ── parse_zerodha tradebook ───────────────────────────────────────────────────
+
+def _zerodha_leg(symbol, inst_type, action, qty, price, date="2024-01-15",
+                 strike=None, option_type=None):
+    return {
+        "trade_id": "T001", "trade_type": action,
+        "instrument_type": inst_type,
+        "symbol": symbol, "expiry": "", "isin": "",
+        "strike": strike or "", "option_type": option_type or "",
+        "quantity": qty, "price": price,
+        "order_execution_time": f"{date} 09:30:00",
+        "exchange": "NSE", "segment": "NFO", "series": "",
+        "auction": "N", "order_id": "O001", "order_type": "LIMIT",
+    }
+
+
+class TestParseZerodhaTradebook:
+
+    def test_equity_swing_matched_pair(self):
+        rows = [
+            _zerodha_leg("RELIANCE EQ", "EQ", "buy",  10, 2000, "2024-01-10"),
+            _zerodha_leg("RELIANCE EQ", "EQ", "sell", 10, 2150, "2024-01-15"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        assert len(trades) == 1
+        t = trades[0]
+        assert "RELIANCE" in t["symbol"]
+        assert t["instrument_type"] == "equity"
+        assert t["entry_price"] == 2000.0
+        assert t["exit_price"] == 2150.0
+        assert t["pnl"] == pytest.approx(1500.0)
+        assert t["status"] == "closed"
+        assert t["broker"] == "Zerodha"
+
+    def test_options_intraday_matched_pair(self):
+        rows = [
+            _zerodha_leg("NIFTY", "CE", "buy",  50, 120.0, "2024-01-18", 22600, "CE"),
+            _zerodha_leg("NIFTY", "CE", "sell", 50, 85.0,  "2024-01-18", 22600, "CE"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["instrument_type"] == "options"
+        assert t["pnl"] == pytest.approx(-1750.0)
+
+    def test_futures_matched_pair(self):
+        rows = [
+            _zerodha_leg("BANKNIFTY", "FUT", "buy",  25, 47500, "2024-03-01"),
+            _zerodha_leg("BANKNIFTY", "FUT", "sell", 25, 47800, "2024-03-14"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["instrument_type"] == "futures"
+        assert t["pnl"] == pytest.approx(7500.0)
+
+    def test_open_buy_leg_creates_no_closed_trade(self):
+        rows = [
+            _zerodha_leg("TCS EQ", "EQ", "buy", 5, 3900, "2024-03-15"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        # Only a buy leg — no matched sell, so no closed trade
+        assert all(t["status"] == "open" for t in trades)
+
+    def test_multiple_symbols_matched_independently(self):
+        rows = [
+            _zerodha_leg("RELIANCE EQ", "EQ", "buy",  10, 2000),
+            _zerodha_leg("INFY EQ",     "EQ", "buy",  5,  1500),
+            _zerodha_leg("RELIANCE EQ", "EQ", "sell", 10, 2100),
+            _zerodha_leg("INFY EQ",     "EQ", "sell", 5,  1450),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        closed = [t for t in trades if t["status"] == "closed"]
+        assert len(closed) == 2
+        symbols = {t["symbol"] for t in closed}
+        assert "RELIANCE EQ" in symbols or any("RELIANCE" in s for s in symbols)
+
+
+# ── parse_upstox P&L format ───────────────────────────────────────────────────
+
+class TestParseUpstoxPnL:
+
+    def _make_upstox_pnl_df(self, rows):
+        df = _df(rows)
+        return _norm_cols(df)
+
+    def test_options_row(self):
+        from services.trade_parser import parse_upstox
+        rows = [{
+            "Scrip Name": "NIFTY", "Symbol": "NIFTY22600CE", "Scrip Opt": "CE",
+            "Qty": "50", "Buy Date": "18-01-2024", "Buy Rate": "120",
+            "Sell Date": "18-01-2024", "Sell Rate": "85",
+            "Total PL": "-1750", "Strike Price": "22600",
+        }]
+        df = self._make_upstox_pnl_df(rows)
+        trades = parse_upstox(df)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["instrument_type"] == "options"
+        assert t["pnl"] == pytest.approx(-1750.0)
+        assert t["entry_price"] == pytest.approx(120.0)
+        assert t["exit_price"] == pytest.approx(85.0)
+        assert t["broker"] == "Upstox"
+
+    def test_equity_row(self):
+        from services.trade_parser import parse_upstox
+        rows = [{
+            "Scrip Name": "RELIANCE", "Symbol": "RELIANCE", "Scrip Opt": "EQ",
+            "Qty": "10", "Buy Date": "10-01-2024", "Buy Rate": "2000",
+            "Sell Date": "15-01-2024", "Sell Rate": "2150",
+            "Total PL": "1500", "Strike Price": "",
+        }]
+        df = self._make_upstox_pnl_df(rows)
+        trades = parse_upstox(df)
+        assert len(trades) == 1
+        t = trades[0]
+        assert t["instrument_type"] == "equity"
+        assert t["pnl"] == pytest.approx(1500.0)
+
+
+# ── parse_dhan ────────────────────────────────────────────────────────────────
+# Dhan Trade History CSV: Exchange, Symbol, Series, Trade Date, Trade Time,
+# Trade No., Order No., Description, Buy/Sell, Qty, Price, Trade Value
+
+def _dhan_leg(symbol, series, side, qty, price, date="2024-01-18"):
+    return {
+        "Exchange": "NSE", "Symbol": symbol, "Series": series,
+        "Trade Date": date, "Trade Time": "09:30:00",
+        "Trade No.": "T001", "Order No.": "O001",
+        "Description": symbol, "Buy/Sell": side,
+        "Qty": qty, "Price": price, "Trade Value": qty * price,
+    }
+
+
+class TestParseDhan:
+
+    def test_options_matched_pair(self):
+        from services.trade_parser import parse_dhan
+        rows = [
+            _dhan_leg("NIFTY22600CE", "CE", "B", 50, 120.0),
+            _dhan_leg("NIFTY22600CE", "CE", "S", 50, 85.0),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_dhan(df)
+        closed = [t for t in trades if t["status"] == "closed"]
+        assert len(closed) >= 1
+        t = closed[0]
+        assert t["instrument_type"] == "options"
+        assert t["pnl"] == pytest.approx(-1750.0)
+
+    def test_equity_matched_pair(self):
+        from services.trade_parser import parse_dhan
+        rows = [
+            _dhan_leg("RELIANCE", "EQ", "B", 10, 2000.0, "2024-01-10"),
+            _dhan_leg("RELIANCE", "EQ", "S", 10, 2150.0, "2024-01-15"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_dhan(df)
+        closed = [t for t in trades if t["status"] == "closed"]
+        assert len(closed) >= 1
+        t = closed[0]
+        assert t["instrument_type"] == "equity"
+        assert t["pnl"] == pytest.approx(1500.0)
+
+    def test_futures_matched_pair(self):
+        from services.trade_parser import parse_dhan
+        rows = [
+            _dhan_leg("BANKNIFTYFUT", "FUT", "B", 25, 47500.0, "2024-03-01"),
+            _dhan_leg("BANKNIFTYFUT", "FUT", "S", 25, 47800.0, "2024-03-14"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_dhan(df)
+        closed = [t for t in trades if t["status"] == "closed"]
+        assert len(closed) >= 1
+        t = closed[0]
+        assert t["instrument_type"] == "futures"
+        assert t["pnl"] == pytest.approx(7500.0)

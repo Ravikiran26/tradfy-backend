@@ -303,11 +303,21 @@ def _clean_float(val) -> Optional[float]:
 
 
 def _detect_instrument(symbol: str, extra: str = "") -> str:
-    s = f"{symbol} {extra}".upper()
-    if any(x in s for x in ("CE", "PE", "CALL", "PUT", " OPT")):
+    extra_up = extra.upper()
+    sym_up   = symbol.upper()
+
+    # Extra field (segment/series like "CE", "PE", "FO", "OPT") takes priority
+    if any(x in extra_up for x in ("CE", "PE", "CALL", "PUT", "OPT", "FNO", "F&O")):
         return "options"
-    if any(x in s for x in ("FUT", "FUTURE")):
+    if any(x in extra_up for x in ("FUT", "FUTURE")):
         return "futures"
+
+    # Symbol: CE/PE must be preceded by a digit (e.g. NIFTY22600CE not RELIANCE/PERSISTENT/PRICE)
+    if re.search(r'\d(CE|PE)$', sym_up) or any(x in sym_up for x in ("CALL", "PUT")):
+        return "options"
+    if any(x in sym_up for x in ("FUT", "FUTURE")):
+        return "futures"
+
     return "equity"
 
 
