@@ -327,11 +327,38 @@ class TestParseZerodhaTradebook:
         t = trades[0]
         assert "RELIANCE" in t["symbol"]
         assert t["instrument_type"] == "equity"
+        assert t["trade_type"] == "equity_swing"
         assert t["entry_price"] == 2000.0
         assert t["exit_price"] == 2150.0
         assert t["pnl"] == pytest.approx(1500.0)
+        assert t["holding_days"] == 5          # buy Jan 10, sell Jan 15
         assert t["status"] == "closed"
         assert t["broker"] == "Zerodha"
+
+    def test_equity_swing_holding_days_calculated(self):
+        # Buy and sell 30 days apart
+        rows = [
+            _zerodha_leg("INFY EQ", "EQ", "buy",  5, 1500, "2024-02-01"),
+            _zerodha_leg("INFY EQ", "EQ", "sell", 5, 1650, "2024-03-02"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        t = [x for x in trades if x["status"] == "closed"][0]
+        assert t["holding_days"] == 30
+        assert t["trade_type"] == "equity_swing"
+
+    def test_intraday_equity_holding_days_zero(self):
+        # Same-day buy and sell
+        rows = [
+            _zerodha_leg("TCS EQ", "EQ", "buy",  2, 3900, "2024-03-15"),
+            _zerodha_leg("TCS EQ", "EQ", "sell", 2, 3950, "2024-03-15"),
+        ]
+        df = _norm_cols(_df(rows))
+        trades = parse_zerodha(df)
+        t = [x for x in trades if x["status"] == "closed"][0]
+        assert t["holding_days"] == 0
+        # Still equity_swing because Zerodha CNC doesn't distinguish intraday
+        assert t["trade_type"] == "equity_swing"
 
     def test_options_intraday_matched_pair(self):
         rows = [
@@ -343,9 +370,11 @@ class TestParseZerodhaTradebook:
         assert len(trades) == 1
         t = trades[0]
         assert t["instrument_type"] == "options"
+        assert t["trade_type"] == "options_intraday"
+        assert t["holding_days"] == 0
         assert t["pnl"] == pytest.approx(-1750.0)
 
-    def test_futures_matched_pair(self):
+    def test_futures_swing_matched_pair(self):
         rows = [
             _zerodha_leg("BANKNIFTY", "FUT", "buy",  25, 47500, "2024-03-01"),
             _zerodha_leg("BANKNIFTY", "FUT", "sell", 25, 47800, "2024-03-14"),
@@ -355,6 +384,8 @@ class TestParseZerodhaTradebook:
         assert len(trades) == 1
         t = trades[0]
         assert t["instrument_type"] == "futures"
+        assert t["trade_type"] == "futures_swing"
+        assert t["holding_days"] == 13
         assert t["pnl"] == pytest.approx(7500.0)
 
     def test_open_buy_leg_creates_no_closed_trade(self):
