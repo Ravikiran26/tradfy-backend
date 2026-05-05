@@ -119,8 +119,9 @@ def parse_generic_csv(df: pd.DataFrame) -> list[dict]:
         trade_date = parse_date(get(row, "trade_date"))
 
         # Infer instrument type from symbol
+        # Options contracts always have a digit before CE/PE (e.g. NIFTY22600CE)
         sym_upper = str(symbol).upper()
-        if sym_upper.endswith("CE") or sym_upper.endswith("PE"):
+        if re.search(r'\d(CE|PE)$', sym_upper):
             instrument_type = "options"
         elif "FUT" in sym_upper:
             instrument_type = "futures"
