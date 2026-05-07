@@ -15,8 +15,8 @@ RAZORPAY_KEY_ID     = os.getenv("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
 
 # Pricing in paise — launch offer
-PRO_MONTHLY_PAISE = 29900   # ₹299/mo (launch offer, was ₹499)
-PRO_YEARLY_PAISE  = 249900  # ₹2,499/yr (launch offer, was ₹3,499)
+PRO_MONTHLY_PAISE = 49900   # ₹499/mo
+PRO_YEARLY_PAISE  = 249900  # ₹2,499/yr
 
 PLAN_AMOUNTS = {
     "monthly": PRO_MONTHLY_PAISE,
