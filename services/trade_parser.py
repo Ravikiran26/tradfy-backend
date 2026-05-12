@@ -211,6 +211,9 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         if broker_lower == "angelone":
             df_smart = _read_angelone_file(file_bytes, filename)
             return parse_angelone(df_smart)
+        if broker_lower == "groww":
+            df_smart = _read_file_with_header_scan(file_bytes, filename)
+            return parse_groww(df_smart)
         df = _read_file(file_bytes, filename)
         return parsers[broker_lower](df)
 
@@ -221,7 +224,7 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
             lambda: parse_angelone(_read_angelone_file(file_bytes, filename)),
             lambda: parse_upstox(_read_file_with_header_scan(file_bytes, filename), file_bytes=file_bytes, filename=filename),
             lambda: parse_zerodha(_read_file_with_header_scan(file_bytes, filename)),
-            lambda: parse_groww(_read_file(file_bytes, filename)),
+            lambda: parse_groww(_read_file_with_header_scan(file_bytes, filename)),
         ]
         for attempt in broker_attempts:
             try:
@@ -821,8 +824,11 @@ def parse_groww(df: pd.DataFrame) -> list[dict]:
     cols = set(df.columns)
 
     pnl_indicators = {"realised_pl", "realised_pnl", "realised_p_l", "net_pnl", "realized_pnl", "pnl"}
+    holdings_indicators = {"unrealised_pl", "unrealised_p_l", "average_buy_price", "closing_price", "closing_value"}
     if cols & pnl_indicators:
         return _parse_groww_pnl(df)
+    if cols & holdings_indicators:
+        return _parse_groww_holdings(df)
     return _parse_groww_transactions(df)
 
 
@@ -865,6 +871,51 @@ def _parse_groww_pnl(df: pd.DataFrame) -> list[dict]:
             "pnl":             pnl,
             "pnl_percent":     pnl_percent,
             "trade_date":      str(trade_date) if trade_date else None,
+            "closed_at":       None,
+            "holding_days":    None,
+            "broker":          "Groww",
+            "sector":          None,
+            "ai_feedback":     None,
+        })
+
+    return trades
+
+
+def _parse_groww_holdings(df: pd.DataFrame) -> list[dict]:
+    """Parse Groww Holdings Statement as open positions."""
+    sym_col   = _get_col(df, ["stock_name", "symbol", "name", "scrip_name"])
+    qty_col   = _get_col(df, ["quantity", "qty"])
+    buy_col   = _get_col(df, ["average_buy_price", "avg_buy_price", "buy_price"])
+    close_col = _get_col(df, ["closing_price", "close_price", "ltp", "current_price"])
+    upnl_col  = _get_col(df, ["unrealised_pl", "unrealised_p_l", "unrealized_pl"])
+
+    trades: list[dict] = []
+    for _, row in df.iterrows():
+        symbol = str(row.get(sym_col, "")).strip().upper() if sym_col else ""
+        if not symbol:
+            continue
+
+        qty         = int(_clean_float(row.get(qty_col)) or 0) if qty_col else 0
+        entry_price = _clean_float(row.get(buy_col))   if buy_col   else None
+        curr_price  = _clean_float(row.get(close_col)) if close_col else None
+        upnl        = _clean_float(row.get(upnl_col))  if upnl_col  else None
+
+        if qty <= 0:
+            continue
+
+        instrument_type = _detect_instrument(symbol)
+        trades.append({
+            "symbol":          symbol,
+            "instrument_type": instrument_type,
+            "trade_type":      _detect_trade_type(instrument_type),
+            "action":          "buy",
+            "status":          "open",
+            "quantity":        qty,
+            "entry_price":     entry_price,
+            "exit_price":      curr_price,
+            "pnl":             upnl,
+            "pnl_percent":     round(upnl / (entry_price * qty) * 100, 2) if upnl and entry_price and qty else None,
+            "trade_date":      None,
             "closed_at":       None,
             "holding_days":    None,
             "broker":          "Groww",
