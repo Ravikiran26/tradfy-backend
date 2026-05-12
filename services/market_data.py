@@ -25,6 +25,32 @@ try:
 except ImportError:
     _SCIPY_AVAILABLE = False
 
+try:
+    import urllib.request, io, pandas as _pd
+
+    def _load_nifty500_map() -> dict:
+        url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=8).read()
+        df = _pd.read_csv(io.BytesIO(raw))
+        mapping: dict = {}
+        for _, row in df.iterrows():
+            name = str(row.get("Company Name", "") or "").strip().upper()
+            sym  = str(row.get("Symbol", "") or "").strip().upper()
+            if not name or not sym:
+                continue
+            mapping[name] = sym
+            # Also index without common suffixes
+            for suf in (" LTD.", " LTD", " LIMITED", " INDUSTRIES", " CORPORATION", " CORP"):
+                if name.endswith(suf):
+                    mapping[name[: -len(suf)].strip()] = sym
+                    break
+        return mapping
+
+    _NIFTY500_MAP: dict = _load_nifty500_map()
+except Exception:
+    _NIFTY500_MAP: dict = {}
+
 
 # ── Symbol parsing ────────────────────────────────────────────────────────────
 
@@ -819,15 +845,15 @@ def _resolve_ticker_info(symbol: str) -> Optional[dict]:
     """
     s = symbol.strip().upper()
 
-    # Check known name→ticker mapping first
-    mapped = _NAME_TO_TICKER.get(s)
+    # Nifty 500 map has current NSE symbols; manual dict catches aliases/abbreviations not in it
+    mapped = _NIFTY500_MAP.get(s) or _NAME_TO_TICKER.get(s)
     if not mapped:
         # Strip common suffixes that aren't part of the NSE ticker
         for suffix in (" LTD", " LIMITED", " LTD.", " PVT", " INDUSTRIES", " CORPORATION", " CORP"):
             if s.endswith(suffix):
                 s = s[: -len(suffix)].strip()
                 break
-        mapped = _NAME_TO_TICKER.get(s)
+        mapped = _NIFTY500_MAP.get(s) or _NAME_TO_TICKER.get(s)
 
     candidates = []
     if mapped:
