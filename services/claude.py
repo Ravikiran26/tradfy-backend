@@ -812,6 +812,32 @@ Rules:
 - pnl may be labelled as: P&L, Profit/Loss, Realised P&L, Net P&L, PnL, Gain/Loss"""
 
 
+def diagnose_empty_file(columns: List[str], sample_rows: List[dict]) -> str:
+    """
+    When a file has no recognisable trades, ask Claude what the file actually
+    is and return a short, user-friendly explanation.
+    """
+    prompt = (
+        "A user uploaded a file to a trade journaling app for Indian stock traders. "
+        "The app could not find any trades in it.\n\n"
+        f"Column names: {', '.join(columns)}\n\n"
+        f"First few rows:\n{json.dumps(sample_rows, ensure_ascii=False, default=str)}\n\n"
+        "In 1-2 sentences, explain what this file actually is (e.g. ledger statement, "
+        "bank statement, account summary) and tell the user exactly which report they "
+        "should download from their broker instead to get their trade history. "
+        "Be specific and friendly. Do not use markdown."
+    )
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text.strip()
+    except Exception:
+        return "No trades found in this file. Please upload your broker's P&L or Trade History report."
+
+
 def infer_csv_mapping(columns: List[str], sample_rows: List[dict]) -> dict:
     """
     Ask Claude to map unknown broker CSV columns to our standard trade fields.

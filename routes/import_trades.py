@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from typing import Optional
 
-from services.trade_parser import parse_broker_file
+from services.trade_parser import parse_broker_file, _best_header_read
+from services.claude import diagnose_empty_file
 from services.supabase_client import bulk_save_trades
 from models import Trade
 from auth import get_current_user
@@ -63,10 +64,30 @@ async def import_trades(
         raise HTTPException(status_code=422, detail=f"Failed to parse file: {str(e)}")
 
     if not trades:
-        raise HTTPException(
-            status_code=422,
-            detail="No trades found in the file. Check that the file is a valid broker export.",
-        )
+        try:
+            df = _best_header_read(file_bytes, filename)
+            columns = [str(c) for c in df.columns.tolist()]
+            cols_lower = " ".join(columns).lower()
+            sample_rows = df.head(5).fillna("").astype(str).to_dict(orient="records")
+
+            # Fast keyword-based diagnosis (no API call needed)
+            if any(k in cols_lower for k in ("running balance", "voucher", "debit", "credit")):
+                message = (
+                    "This looks like a ledger or account statement, not a trade report. "
+                    "Please download your Trade History or P&L Report from your broker's "
+                    "Reports section (not the Ledger/Statement section)."
+                )
+            elif any(k in cols_lower for k in ("opening balance", "closing balance", "fund")):
+                message = (
+                    "This appears to be a funds/account summary, not a trade file. "
+                    "Please upload your broker's P&L Statement or Trade Book instead."
+                )
+            else:
+                # Ask Claude for a specific diagnosis
+                message = diagnose_empty_file(columns, sample_rows)
+        except Exception:
+            message = "No trades found in this file. Please upload your broker's P&L or Trade History report."
+        raise HTTPException(status_code=422, detail=message)
 
     # Attach user_id to every trade
     for trade in trades:
