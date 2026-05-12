@@ -182,25 +182,9 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         df = _read_file(file_bytes, filename)
         return parsers[broker_lower](df)
 
-    # ── Unknown / auto broker → try every parser, then Claude ───────────────
+    # ── Auto-detect: find the best header row, let Claude map columns ────────
     if broker_lower not in parsers:
-        # Try each broker's smart reader + parser; return first that yields trades
-        attempts = [
-            ("dhan",      lambda: parse_dhan(_read_dhan_file(file_bytes, filename))),
-            ("upstox",    lambda: parse_upstox(_read_file_with_header_scan(file_bytes, filename), file_bytes=file_bytes, filename=filename)),
-            ("zerodha",   lambda: parse_zerodha(_read_file_with_header_scan(file_bytes, filename))),
-            ("angelone",  lambda: parse_angelone(_read_angelone_file(file_bytes, filename))),
-            ("groww",     lambda: parse_groww(_read_file(file_bytes, filename))),
-        ]
-        for _name, attempt in attempts:
-            try:
-                result = attempt()
-                if result:
-                    return result
-            except Exception:
-                continue
-        # All parsers failed — hand column names + sample to Claude
-        df = _read_file_with_header_scan(file_bytes, filename)
+        df = _best_header_read(file_bytes, filename)
         return parse_generic_csv(df)
 
     # ── Known broker: try specific parser, fall back to Claude on failure ─────
@@ -222,6 +206,35 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         pass
 
     return []
+
+
+def _best_header_read(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Try every read strategy and return the DataFrame whose columns look most
+    like real headers (fewest 'Unnamed' columns, most named columns).
+    This gives Claude the cleanest possible column names to map from.
+    """
+    strategies = [
+        lambda: _read_dhan_file(file_bytes, filename),
+        lambda: _read_angelone_file(file_bytes, filename),
+        lambda: _read_file_with_header_scan(file_bytes, filename),
+        lambda: _read_file(file_bytes, filename),
+    ]
+    best_df = None
+    best_score = -1
+    for strategy in strategies:
+        try:
+            df = strategy()
+            if df is None or df.empty:
+                continue
+            unnamed = sum(1 for c in df.columns if str(c).startswith("Unnamed"))
+            score = len(df.columns) - unnamed * 2   # penalise Unnamed columns
+            if score > best_score:
+                best_score = score
+                best_df = df
+        except Exception:
+            continue
+    return best_df if best_df is not None else _read_file(file_bytes, filename)
 
 
 def _read_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
