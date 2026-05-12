@@ -41,19 +41,41 @@ def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
         symbol      = payload.get("symbol")
         trade_date  = payload.get("trade_date")
         entry_price = payload.get("entry_price")
+        pnl         = payload.get("pnl")
         action      = payload.get("action")
 
-        if user_id and symbol and trade_date and entry_price:
-            query = (
-                db.table("trades")
-                .select("id")
-                .eq("user_id", user_id)
-                .eq("symbol", symbol)
-                .eq("trade_date", trade_date)
-                .eq("entry_price", entry_price)
-            )
-            if action:
-                query = query.eq("action", action)
+        if user_id and symbol and trade_date:
+            if entry_price is not None:
+                # Tradebook format: key on symbol + date + entry price + action
+                query = (
+                    db.table("trades")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("symbol", symbol)
+                    .eq("trade_date", trade_date)
+                    .eq("entry_price", entry_price)
+                )
+                if action:
+                    query = query.eq("action", action)
+            elif pnl is not None:
+                # P&L report format: key on symbol + date + pnl (no entry price column)
+                query = (
+                    db.table("trades")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("symbol", symbol)
+                    .eq("trade_date", trade_date)
+                    .eq("pnl", pnl)
+                )
+            else:
+                # Minimal fallback: symbol + date only
+                query = (
+                    db.table("trades")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("symbol", symbol)
+                    .eq("trade_date", trade_date)
+                )
             existing = query.execute()
             if existing.data:
                 continue  # Skip duplicate
