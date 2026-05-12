@@ -104,10 +104,34 @@ def parse_generic_csv(df: pd.DataFrame) -> list[dict]:
                 continue
         return None
 
+    # Words that appear in disclaimer/footer/total rows but never in valid stock symbols
+    _JUNK_PREFIXES = (
+        "FROM ", "NOTE:", "NOTE ", "THIS ", "THE ", "AS PER", "DISCLAIMER",
+        "TOTAL", "GRAND", "NET ", "SUB-TOTAL", "SUB TOTAL", "PURSUANT",
+        "ALL ", "FOR ", "IN ", "WE ", "OUR ", "ANY ",
+    )
+
+    def _is_valid_symbol(sym: str) -> bool:
+        s = sym.strip().upper()
+        if not s or s in ("NAN", "NONE", "SYMBOL", "SCRIP", "SECURITY", "INSTRUMENT", "STOCK"):
+            return False
+        if len(s) > 40:
+            return False
+        # More than 4 spaces → almost certainly a sentence / disclaimer text
+        if s.count(" ") > 4:
+            return False
+        if any(s.startswith(p) for p in _JUNK_PREFIXES):
+            return False
+        return True
+
     trades = []
     for _, row in df.iterrows():
         symbol = get(row, "symbol")
         if not symbol or str(symbol).strip() in ("", "nan", "None"):
+            continue
+
+        sym_str = str(symbol).strip()
+        if not _is_valid_symbol(sym_str):
             continue
 
         action_raw = str(get(row, "action") or "").lower().strip()
@@ -119,9 +143,17 @@ def parse_generic_csv(df: pd.DataFrame) -> list[dict]:
         qty = safe_float(get(row, "quantity"))
         trade_date = parse_date(get(row, "trade_date"))
 
+        # Skip rows with no useful trade data at all
+        if pnl is None and entry is None and exit_ is None and qty is None:
+            continue
+
+        # Skip rows with no date (avoids fake "today" trades from bad rows)
+        if not trade_date:
+            continue
+
         # Infer instrument type from symbol
         # Options contracts always have a digit before CE/PE (e.g. NIFTY22600CE)
-        sym_upper = str(symbol).upper()
+        sym_upper = sym_str.upper()
         if re.search(r'\d(CE|PE)$', sym_upper):
             instrument_type = "options"
         elif "FUT" in sym_upper:
@@ -130,7 +162,7 @@ def parse_generic_csv(df: pd.DataFrame) -> list[dict]:
             instrument_type = "equity"
 
         trades.append({
-            "symbol":          str(symbol).strip().upper(),
+            "symbol":          sym_upper,
             "instrument_type": instrument_type,
             "action":          action,
             "quantity":        int(qty) if qty is not None else None,
