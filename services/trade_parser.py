@@ -89,7 +89,8 @@ def parse_generic_csv(df: pd.DataFrame) -> list[dict]:
 
     def safe_float(val):
         try:
-            return float(str(val).replace(",", "").replace("₹", "").strip())
+            result = float(str(val).replace(",", "").replace("₹", "").strip())
+            return None if result != result else result  # NaN != NaN is True
         except (ValueError, TypeError):
             return None
 
@@ -181,15 +182,26 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         df = _read_file(file_bytes, filename)
         return parsers[broker_lower](df)
 
-    # ── Unknown / auto broker → smart header scan, then detect, then Claude ──
+    # ── Unknown / auto broker → try every parser, then Claude ───────────────
     if broker_lower not in parsers:
-        # Use header-scanning read so metadata rows don't pollute column names
+        # Try each broker's smart reader + parser; return first that yields trades
+        attempts = [
+            ("dhan",      lambda: parse_dhan(_read_dhan_file(file_bytes, filename))),
+            ("upstox",    lambda: parse_upstox(_read_file_with_header_scan(file_bytes, filename), file_bytes=file_bytes, filename=filename)),
+            ("zerodha",   lambda: parse_zerodha(_read_file_with_header_scan(file_bytes, filename))),
+            ("angelone",  lambda: parse_angelone(_read_angelone_file(file_bytes, filename))),
+            ("groww",     lambda: parse_groww(_read_file(file_bytes, filename))),
+        ]
+        for _name, attempt in attempts:
+            try:
+                result = attempt()
+                if result:
+                    return result
+            except Exception:
+                continue
+        # All parsers failed — hand column names + sample to Claude
         df = _read_file_with_header_scan(file_bytes, filename)
-        detected = _detect_broker(df)
-        if detected:
-            broker_lower = detected
-        else:
-            return parse_generic_csv(df)
+        return parse_generic_csv(df)
 
     # ── Known broker: try specific parser, fall back to Claude on failure ─────
     try:
@@ -314,7 +326,8 @@ def _clean_float(val) -> Optional[float]:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     try:
-        return float(str(val).replace(",", "").replace("₹", "").replace(" ", "").strip())
+        result = float(str(val).replace(",", "").replace("₹", "").replace(" ", "").strip())
+        return None if result != result else result  # NaN != NaN is True
     except (ValueError, TypeError):
         return None
 
