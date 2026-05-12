@@ -403,7 +403,11 @@ def _detect_instrument(symbol: str, extra: str = "") -> str:
         return "futures"
 
     # Symbol: CE/PE must be preceded by a digit (e.g. NIFTY22600CE not RELIANCE/PERSISTENT/PRICE)
-    if re.search(r'\d(CE|PE)$', sym_up) or any(x in sym_up for x in ("CALL", "PUT")):
+    # Also catches Dhan/Upstox space-separated format: "OPT NIFTY 25200 CE", "NIFTY 22600 CE"
+    if (re.search(r'\d(CE|PE)$', sym_up)
+            or sym_up.endswith(" CE") or sym_up.endswith(" PE")
+            or sym_up.startswith("OPT ")
+            or any(x in sym_up for x in ("CALL", "PUT"))):
         return "options"
     if any(x in sym_up for x in ("FUT", "FUTURE")):
         return "futures"

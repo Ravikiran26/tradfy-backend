@@ -44,9 +44,10 @@ def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
         pnl         = payload.get("pnl")
         action      = payload.get("action")
 
+        query = None
         if user_id and symbol and trade_date:
             if entry_price is not None:
-                # Tradebook format: key on symbol + date + entry price + action
+                # Tradebook format: symbol + date + entry price + action
                 query = (
                     db.table("trades")
                     .select("id")
@@ -58,7 +59,7 @@ def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
                 if action:
                     query = query.eq("action", action)
             elif pnl is not None:
-                # P&L report format: key on symbol + date + pnl (no entry price column)
+                # P&L report with date: symbol + date + pnl
                 query = (
                     db.table("trades")
                     .select("id")
@@ -68,7 +69,6 @@ def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
                     .eq("pnl", pnl)
                 )
             else:
-                # Minimal fallback: symbol + date only
                 query = (
                     db.table("trades")
                     .select("id")
@@ -76,6 +76,29 @@ def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
                     .eq("symbol", symbol)
                     .eq("trade_date", trade_date)
                 )
+        elif user_id and symbol and not trade_date:
+            # Dhan P&L format: no trade dates — key on symbol + entry_price + pnl
+            if entry_price is not None and pnl is not None:
+                query = (
+                    db.table("trades")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("symbol", symbol)
+                    .eq("entry_price", entry_price)
+                    .eq("pnl", pnl)
+                )
+            elif entry_price is not None:
+                # Open positions: symbol + entry_price (no pnl yet)
+                query = (
+                    db.table("trades")
+                    .select("id")
+                    .eq("user_id", user_id)
+                    .eq("symbol", symbol)
+                    .eq("entry_price", entry_price)
+                    .eq("status", payload.get("status", "open"))
+                )
+
+        if query is not None:
             existing = query.execute()
             if existing.data:
                 continue  # Skip duplicate
