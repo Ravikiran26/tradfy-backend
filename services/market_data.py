@@ -732,6 +732,94 @@ def get_swing_context(symbol: str, trade_date, entry_price: float = 0, as_of_dat
         return None
 
 
+# Common NSE tickers where company name → ticker isn't straightforward
+_NAME_TO_TICKER = {
+    "BAJAJ FINANCE": "BAJFINANCE",
+    "BAJAJ FINSERV": "BAJAJFINSV",
+    "BAJAJ HOLDINGS": "BAJAJHLDNG",
+    "HINDUSTAN UNILEVER": "HINDUNILVR",
+    "HINDUSTAN UNILEVER LTD": "HINDUNILVR",
+    "STATE BANK OF INDIA": "SBIN",
+    "LARSEN & TOUBRO": "LT",
+    "L&T": "LT",
+    "MAHINDRA & MAHINDRA": "M&M",
+    "OIL & NATURAL GAS": "ONGC",
+    "ONGC": "ONGC",
+    "NTPC": "NTPC",
+    "POWER GRID": "POWERGRID",
+    "POWER GRID CORPORATION": "POWERGRID",
+    "TATA CONSULTANCY SERVICES": "TCS",
+    "TATA MOTORS": "TATAMOTORS",
+    "TATA STEEL": "TATASTEEL",
+    "TATA POWER": "TATAPOWER",
+    "WIPRO": "WIPRO",
+    "INFOSYS": "INFY",
+    "HCL TECHNOLOGIES": "HCLTECH",
+    "HCL TECH": "HCLTECH",
+    "KOTAK MAHINDRA BANK": "KOTAKBANK",
+    "KOTAK MAHINDRA": "KOTAKBANK",
+    "AXIS BANK": "AXISBANK",
+    "ICICI BANK": "ICICIBANK",
+    "HDFC LIFE": "HDFCLIFE",
+    "SBI LIFE": "SBILIFE",
+    "BHARTI AIRTEL": "BHARTIARTL",
+    "ADANI ENTERPRISES": "ADANIENT",
+    "ADANI PORTS": "ADANIPORTS",
+    "JSPL": "JINDALSTEL",
+    "JINDAL STEEL": "JINDALSTEL",
+    "GRASIM INDUSTRIES": "GRASIM",
+    "ULTRA TECH CEMENT": "ULTRACEMCO",
+    "ULTRATECH CEMENT": "ULTRACEMCO",
+    "DIVI'S LABORATORIES": "DIVISLAB",
+    "DIVIS LAB": "DIVISLAB",
+    "CIPLA": "CIPLA",
+    "DR REDDY": "DRREDDY",
+    "DR. REDDY'S": "DRREDDY",
+    "SUN PHARMA": "SUNPHARMA",
+    "SUN PHARMACEUTICAL": "SUNPHARMA",
+}
+
+
+def _resolve_ticker_info(symbol: str) -> Optional[dict]:
+    """
+    Try multiple ticker formats to find a valid yfinance result.
+    Handles: plain tickers (RELIANCE), full names (RELIANCE INDUSTRIES LTD),
+    and names with spaces (HDFC BANK → HDFCBANK).
+    """
+    s = symbol.strip().upper()
+
+    # Check known name→ticker mapping first
+    mapped = _NAME_TO_TICKER.get(s)
+    if not mapped:
+        # Strip common suffixes that aren't part of the NSE ticker
+        for suffix in (" LTD", " LIMITED", " LTD.", " PVT", " INDUSTRIES", " CORPORATION", " CORP"):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)].strip()
+                break
+        mapped = _NAME_TO_TICKER.get(s)
+
+    candidates = []
+    if mapped:
+        candidates.append(f"{mapped}.NS")
+    candidates += [
+        f"{s}.NS",                         # RELIANCE.NS
+        f"{s.replace(' ', '')}.NS",        # HDFCBANK.NS from "HDFC BANK"
+        f"{s.split()[0]}.NS",              # first word only
+        f"{s}.BO",                         # BSE fallback
+        s,                                 # bare symbol (US/index)
+    ]
+
+    for cand in dict.fromkeys(candidates):   # deduplicate, preserve order
+        try:
+            t = yf.Ticker(cand)
+            info = t.info
+            if info and info.get("regularMarketPrice"):
+                return info
+        except Exception:
+            continue
+    return None
+
+
 def get_fundamentals(symbol: str) -> Optional[dict]:
     """
     Fetch key fundamental data for an NSE-listed equity via yfinance.
@@ -741,12 +829,7 @@ def get_fundamentals(symbol: str) -> Optional[dict]:
     if not _YF_AVAILABLE:
         return None
     try:
-        ticker = yf.Ticker(f"{symbol.upper()}.NS")
-        info = ticker.info
-        if not info or info.get("quoteType") not in ("EQUITY", "ETF", None):
-            # Try without exchange suffix
-            ticker = yf.Ticker(symbol.upper())
-            info = ticker.info
+        info = _resolve_ticker_info(symbol)
         if not info:
             return None
 
