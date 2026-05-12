@@ -9,7 +9,7 @@ from rate_limit import limiter
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 
-SUPPORTED_BROKERS = {"zerodha", "upstox", "groww", "dhan"}
+SUPPORTED_BROKERS = {"zerodha", "upstox", "groww", "dhan", "angelone", "auto"}
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
@@ -24,7 +24,7 @@ async def import_trades(
     """
     Import trades from a broker CSV/Excel export.
 
-    Supported brokers: zerodha, upstox, groww, dhan
+    Supported brokers: zerodha, upstox, groww, dhan, angelone, auto
     Supported file formats: .csv, .xlsx, .xls
 
     The endpoint:

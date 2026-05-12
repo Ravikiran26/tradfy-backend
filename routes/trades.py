@@ -339,8 +339,18 @@ def open_positions(user_id: str = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
     result = []
+    today = datetime.now(timezone.utc).date()
     for row in rows:
-        days = _days_since(row["created_at"]) if row.get("created_at") else 0
+        # Use actual trade_date (when they bought) not created_at (when they uploaded)
+        trade_date_str = row.get("trade_date")
+        if trade_date_str:
+            try:
+                td = date_cls.fromisoformat(str(trade_date_str)[:10])
+                days = (today - td).days
+            except (ValueError, TypeError):
+                days = _days_since(row["created_at"]) if row.get("created_at") else 0
+        else:
+            days = _days_since(row["created_at"]) if row.get("created_at") else 0
         result.append(OpenPosition(trade=Trade(**row), days_held=days))
     return result
 

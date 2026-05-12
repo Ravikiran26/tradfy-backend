@@ -150,7 +150,11 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
     """
     Main entry point.
     broker: 'zerodha' | 'upstox' | 'groww' | 'dhan' | 'angelone' | 'auto' (case-insensitive)
-    Returns list of trade dicts ready for DB insert (no user_id yet).
+
+    Parse order:
+    1. Try the broker-specific parser (or auto-detect)
+    2. If that returns 0 trades OR raises an exception → fall back to Claude
+    3. Claude fallback also returns 0 → raise so the user gets a clear error
     """
     df = _read_file(file_bytes, filename)
 
@@ -163,36 +167,47 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         "angelone":  parse_angelone,
     }
 
+    def _try_known_broker() -> list[dict]:
+        if broker_lower == "upstox":
+            df_smart = _read_file_with_header_scan(file_bytes, filename)
+            return parse_upstox(df_smart, file_bytes=file_bytes, filename=filename)
+        if broker_lower == "zerodha":
+            df_smart = _read_file_with_header_scan(file_bytes, filename)
+            return parse_zerodha(df_smart)
+        if broker_lower == "dhan":
+            df_smart = _read_dhan_file(file_bytes, filename)
+            return parse_dhan(df_smart)
+        if broker_lower == "angelone":
+            df_smart = _read_angelone_file(file_bytes, filename)
+            return parse_angelone(df_smart)
+        return parsers[broker_lower](df)
+
+    # ── Unknown / auto broker → auto-detect first, then Claude ───────────────
     if broker_lower not in parsers:
-        # Try auto-detect from column names
         detected = _detect_broker(df)
         if detected:
             broker_lower = detected
         else:
-            # Fall back to AI-powered generic parser
             return parse_generic_csv(df)
 
-    # For Upstox, try P&L format first (files with metadata header rows)
-    if broker_lower == "upstox":
-        df_smart = _read_file_with_header_scan(file_bytes, filename)
-        return parse_upstox(df_smart, file_bytes=file_bytes, filename=filename)
+    # ── Known broker: try specific parser, fall back to Claude on failure ─────
+    try:
+        trades = _try_known_broker()
+    except Exception:
+        trades = []
 
-    # For Zerodha, try smart header scan first (handles P&L Excel with metadata rows)
-    if broker_lower == "zerodha":
-        df_smart = _read_file_with_header_scan(file_bytes, filename)
-        return parse_zerodha(df_smart)
+    if trades:
+        return trades
 
-    # For Dhan, find the row containing "Security Name" (P&L report has metadata before it)
-    if broker_lower == "dhan":
-        df_smart = _read_dhan_file(file_bytes, filename)
-        return parse_dhan(df_smart)
+    # Specific parser returned nothing — try Claude before giving up
+    try:
+        claude_trades = parse_generic_csv(df)
+        if claude_trades:
+            return claude_trades
+    except Exception:
+        pass
 
-    # For Angel One, scan past metadata rows to find the real header
-    if broker_lower == "angelone":
-        df_smart = _read_angelone_file(file_bytes, filename)
-        return parse_angelone(df_smart)
-
-    return parsers[broker_lower](df)
+    return []
 
 
 def _read_file(file_bytes: bytes, filename: str) -> pd.DataFrame:

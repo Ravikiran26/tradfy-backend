@@ -27,14 +27,42 @@ def save_trade(trade_dict: dict) -> dict:
 
 
 def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
-    """Insert multiple trades in a single request and return the created records."""
+    """Insert multiple trades, skipping duplicates (same user+symbol+trade_date+entry_price+action)."""
     if not trade_list:
         return []
     db = get_client()
-    # Strip None values from each row
-    payloads = [{k: v for k, v in t.items() if v is not None} for t in trade_list]
-    result = db.table("trades").insert(payloads).execute()
-    return result.data
+
+    saved = []
+    for trade in trade_list:
+        payload = {k: v for k, v in trade.items() if v is not None}
+
+        # Check for existing trade with same key fields to prevent double-upload
+        user_id     = payload.get("user_id")
+        symbol      = payload.get("symbol")
+        trade_date  = payload.get("trade_date")
+        entry_price = payload.get("entry_price")
+        action      = payload.get("action")
+
+        if user_id and symbol and trade_date and entry_price:
+            query = (
+                db.table("trades")
+                .select("id")
+                .eq("user_id", user_id)
+                .eq("symbol", symbol)
+                .eq("trade_date", trade_date)
+                .eq("entry_price", entry_price)
+            )
+            if action:
+                query = query.eq("action", action)
+            existing = query.execute()
+            if existing.data:
+                continue  # Skip duplicate
+
+        result = db.table("trades").insert(payload).execute()
+        if result.data:
+            saved.append(result.data[0])
+
+    return saved
 
 
 def get_user_trades(user_id: str) -> list[dict]:
