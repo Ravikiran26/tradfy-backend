@@ -214,8 +214,23 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         df = _read_file(file_bytes, filename)
         return parsers[broker_lower](df)
 
-    # ── Auto-detect: find the best header row, let Claude map columns ────────
+    # ── Auto-detect: try every known broker parser first, fall back to Claude ──
     if broker_lower not in parsers:
+        broker_attempts = [
+            lambda: parse_dhan(_read_dhan_file(file_bytes, filename)),
+            lambda: parse_angelone(_read_angelone_file(file_bytes, filename)),
+            lambda: parse_upstox(_read_file_with_header_scan(file_bytes, filename), file_bytes=file_bytes, filename=filename),
+            lambda: parse_zerodha(_read_file_with_header_scan(file_bytes, filename)),
+            lambda: parse_groww(_read_file(file_bytes, filename)),
+        ]
+        for attempt in broker_attempts:
+            try:
+                result = attempt()
+                if result:
+                    return result
+            except Exception:
+                continue
+        # No known parser matched — let Claude infer column mapping
         df = _best_header_read(file_bytes, filename)
         return parse_generic_csv(df)
 
