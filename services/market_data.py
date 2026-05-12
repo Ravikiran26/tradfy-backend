@@ -777,6 +777,32 @@ _NAME_TO_TICKER = {
     "DR. REDDY'S": "DRREDDY",
     "SUN PHARMA": "SUNPHARMA",
     "SUN PHARMACEUTICAL": "SUNPHARMA",
+    "LEMON TREE HOTELS": "LEMONTREE",
+    "LEMON TREE": "LEMONTREE",
+    "INDIAN HOTELS": "INDHOTEL",
+    "INDIAN HOTELS CO": "INDHOTEL",
+    "EIH": "EIHOTEL",
+    "BRIGADE ENTERPRISES": "BRIGADE",
+    "PRESTIGE ESTATES": "PRESTIGE",
+    "GODREJ PROPERTIES": "GODREJPROP",
+    "OBEROI REALTY": "OBEROIRLTY",
+    "PVR INOX": "PVRINOX",
+    "INTERGLOBE AVIATION": "INDIGO",
+    "INDIGO": "INDIGO",
+    "SPICEJET": "SPICEJET",
+    "ZOMATO": "ZOMATO",
+    "NYKAA": "NYKAA",
+    "PAYTM": "PAYTM",
+    "POLICYBAZAAR": "POLICYBZR",
+    "PB FINTECH": "POLICYBZR",
+    "DELHIVERY": "DELHIVERY",
+    "CARTRADE": "CARTRADE",
+    "DEVYANI INTERNATIONAL": "DEVYANI",
+    "SAPPHIRE FOODS": "SAPPHIRE",
+    "JUBILANT FOODWORKS": "JUBLFOOD",
+    "WESTLIFE FOODWORLD": "WESTLIFE",
+    "METRO BRANDS": "METROBRAND",
+    "CAMPUS ACTIVEWEAR": "CAMPUS",
 }
 
 
@@ -813,7 +839,13 @@ def _resolve_ticker_info(symbol: str) -> Optional[dict]:
         try:
             t = yf.Ticker(cand)
             info = t.info
-            if info and info.get("regularMarketPrice"):
+            if info and (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or info.get("previousClose")
+                or info.get("longName")
+                or info.get("shortName")
+            ):
                 return info
         except Exception:
             continue
