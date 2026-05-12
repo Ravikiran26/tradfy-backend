@@ -27,87 +27,78 @@ def save_trade(trade_dict: dict) -> dict:
 
 
 def bulk_save_trades(trade_list: list[dict]) -> list[dict]:
-    """Insert multiple trades, skipping duplicates (same user+symbol+trade_date+entry_price+action)."""
+    """Insert multiple trades, skipping duplicates. Uses 2 DB round-trips regardless of trade count."""
     if not trade_list:
         return []
     db = get_client()
 
-    saved = []
+    user_id = next((t.get("user_id") for t in trade_list if t.get("user_id")), None)
+    if not user_id:
+        return []
+
+    # ── 1 query: fetch all existing trades for this user ─────────────────────
+    existing_rows = (
+        db.table("trades")
+        .select("symbol, trade_date, entry_price, pnl, status")
+        .eq("user_id", user_id)
+        .execute()
+    ).data or []
+
+    # Build fingerprint sets for fast dedup lookup
+    existing_with_date:    set = set()  # (symbol, date, entry_price)
+    existing_pnl_date:     set = set()  # (symbol, date, pnl)
+    existing_date_only:    set = set()  # (symbol, date)
+    existing_no_date:      set = set()  # (symbol, entry_price, pnl)
+    existing_open_no_date: set = set()  # (symbol, entry_price, status)
+
+    for r in existing_rows:
+        sym   = r.get("symbol", "")
+        date  = r.get("trade_date")
+        ep    = r.get("entry_price")
+        pnl   = r.get("pnl")
+        st    = r.get("status", "open")
+        if date and ep is not None:
+            existing_with_date.add((sym, date, ep))
+        if date and pnl is not None:
+            existing_pnl_date.add((sym, date, pnl))
+        if date:
+            existing_date_only.add((sym, date))
+        if not date and ep is not None and pnl is not None:
+            existing_no_date.add((sym, ep, pnl))
+        if not date and ep is not None:
+            existing_open_no_date.add((sym, ep, st))
+
+    # ── Filter out duplicates in Python (no extra DB calls) ──────────────────
+    new_payloads = []
     for trade in trade_list:
         payload = {k: v for k, v in trade.items() if v is not None}
+        sym   = payload.get("symbol", "")
+        date  = payload.get("trade_date")
+        ep    = payload.get("entry_price")
+        pnl   = payload.get("pnl")
+        st    = payload.get("status", "open")
 
-        # Check for existing trade with same key fields to prevent double-upload
-        user_id     = payload.get("user_id")
-        symbol      = payload.get("symbol")
-        trade_date  = payload.get("trade_date")
-        entry_price = payload.get("entry_price")
-        pnl         = payload.get("pnl")
-        action      = payload.get("action")
+        is_dup = False
+        if date and ep is not None:
+            is_dup = (sym, date, ep) in existing_with_date
+        elif date and pnl is not None:
+            is_dup = (sym, date, pnl) in existing_pnl_date
+        elif date:
+            is_dup = (sym, date) in existing_date_only
+        elif ep is not None and pnl is not None:
+            is_dup = (sym, ep, pnl) in existing_no_date
+        elif ep is not None:
+            is_dup = (sym, ep, st) in existing_open_no_date
 
-        query = None
-        if user_id and symbol and trade_date:
-            if entry_price is not None:
-                # Tradebook format: symbol + date + entry price + action
-                query = (
-                    db.table("trades")
-                    .select("id")
-                    .eq("user_id", user_id)
-                    .eq("symbol", symbol)
-                    .eq("trade_date", trade_date)
-                    .eq("entry_price", entry_price)
-                )
-                if action:
-                    query = query.eq("action", action)
-            elif pnl is not None:
-                # P&L report with date: symbol + date + pnl
-                query = (
-                    db.table("trades")
-                    .select("id")
-                    .eq("user_id", user_id)
-                    .eq("symbol", symbol)
-                    .eq("trade_date", trade_date)
-                    .eq("pnl", pnl)
-                )
-            else:
-                query = (
-                    db.table("trades")
-                    .select("id")
-                    .eq("user_id", user_id)
-                    .eq("symbol", symbol)
-                    .eq("trade_date", trade_date)
-                )
-        elif user_id and symbol and not trade_date:
-            # Dhan P&L format: no trade dates — key on symbol + entry_price + pnl
-            if entry_price is not None and pnl is not None:
-                query = (
-                    db.table("trades")
-                    .select("id")
-                    .eq("user_id", user_id)
-                    .eq("symbol", symbol)
-                    .eq("entry_price", entry_price)
-                    .eq("pnl", pnl)
-                )
-            elif entry_price is not None:
-                # Open positions: symbol + entry_price (no pnl yet)
-                query = (
-                    db.table("trades")
-                    .select("id")
-                    .eq("user_id", user_id)
-                    .eq("symbol", symbol)
-                    .eq("entry_price", entry_price)
-                    .eq("status", payload.get("status", "open"))
-                )
+        if not is_dup:
+            new_payloads.append(payload)
 
-        if query is not None:
-            existing = query.execute()
-            if existing.data:
-                continue  # Skip duplicate
+    if not new_payloads:
+        return []
 
-        result = db.table("trades").insert(payload).execute()
-        if result.data:
-            saved.append(result.data[0])
-
-    return saved
+    # ── 1 query: bulk insert all new trades ───────────────────────────────────
+    result = db.table("trades").insert(new_payloads).execute()
+    return result.data or []
 
 
 def get_user_trades(user_id: str) -> list[dict]:
