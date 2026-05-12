@@ -113,30 +113,11 @@ async def upload_trade_screenshot(
     user_id: str = Depends(get_current_user),
 ):
     """
-    Accept a broker screenshot and:
-    - Multi-trade P&L screen → extract all trades, bulk save, return session feedback
-    - Intraday / options     → extract + full feedback + save
-    - Swing OPEN             → extract + entry observation only + save (status=open)
-    - Swing CLOSED + linked_trade_id → calculate P&L, holding_days, full swing feedback
-    - Swing CLOSED + no linked_trade_id → save as standalone closed trade with full feedback
-    trade_type_override: optional — if user explicitly selected the trade type on the frontend,
-    use it instead of the AI-detected type (e.g. options_scalping, options_positional).
+    Accept a broker screenshot, extract trade data and save it.
+    AI coaching is NOT generated here — use POST /{trade_id}/generate-coaching.
+    trade_type_override: optional — if user explicitly selected the trade type on the frontend.
     """
     image_bytes, media_type = await _read_image(file)
-
-    # ── AI usage gate ─────────────────────────────────────────────────────────
-    if not is_user_pro(user_id):
-        used = count_ai_analyses(user_id)
-        if used >= FREE_AI_LIMIT:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "code":    "UPGRADE_REQUIRED",
-                    "message": f"You've used all {FREE_AI_LIMIT} free AI analyses. Upgrade to Pro for unlimited coaching.",
-                    "used":    used,
-                    "limit":   FREE_AI_LIMIT,
-                }
-            )
 
     # ── Extract all trades from screenshot ───────────────────────────────────
     try:
@@ -149,12 +130,7 @@ async def upload_trade_screenshot(
 
     # ── Multi-trade path: P&L summary screenshots ────────────────────────────
     if len(all_trades) > 1:
-        try:
-            feedback = generate_session_feedback(all_trades)
-        except Exception:
-            feedback = "Session logged. Feedback unavailable at this time."
-
-        payloads = [{**t, "user_id": user_id, "ai_feedback": feedback} for t in all_trades]
+        payloads = [{**t, "user_id": user_id} for t in all_trades]
         try:
             saved = bulk_save_trades(payloads)
         except Exception as e:
@@ -162,42 +138,17 @@ async def upload_trade_screenshot(
 
         return MultiTradeResponse(
             trades=[Trade(**t) for t in saved],
-            feedback=feedback,
+            feedback="",
             count=len(saved),
         )
 
-    # ── Single trade path (existing logic) ───────────────────────────────────
+    # ── Single trade path ─────────────────────────────────────────────────────
     trade_data = all_trades[0]
-    # Apply user-selected trade type override (frontend knows better than AI for options sub-types)
     if trade_type_override:
         trade_data["trade_type"] = trade_type_override
 
     trade_type = trade_data.get("trade_type", "options_intraday")
     status     = trade_data.get("status", "closed")
-
-    # Build checklist context for AI prompts
-    checklist_ctx = None
-    if any([checklist_planned, checklist_stoploss, checklist_strategy]):
-        checklist_ctx = {
-            "planned": checklist_planned,
-            "stoploss": checklist_stoploss,
-            "strategy": checklist_strategy,
-        }
-
-    # ── Branch: swing open ───────────────────────────────────────────────────
-    if trade_type in SWING_TYPES and status == "open":
-        try:
-            feedback = generate_entry_observation(trade_data)
-        except Exception:
-            feedback = "Entry logged. Feedback unavailable at this time."
-
-        payload = {**trade_data, "user_id": user_id, "ai_feedback": feedback}
-        try:
-            saved = save_trade(payload)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save trade: {str(e)}")
-
-        return FeedbackResponse(trade=Trade(**saved), feedback=feedback)
 
     # ── Branch: swing closed + linked open position ───────────────────────────
     if trade_type in SWING_TYPES and status == "closed" and linked_trade_id:
@@ -232,59 +183,16 @@ async def upload_trade_screenshot(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to update open trade: {str(e)}")
 
-        # Full swing feedback on the now-complete trade
-        completed_trade_data = {**updated}
-        try:
-            user_history = get_user_trade_history(user_id)
-            feedback = generate_swing_feedback(completed_trade_data, user_history, checklist=checklist_ctx)
-        except Exception:
-            feedback = "Feedback unavailable at this time."
+        return FeedbackResponse(trade=Trade(**updated), feedback="")
 
-        # Save the close screenshot as a linked record for audit trail
-        close_payload = {
-            **trade_data,
-            "user_id":         user_id,
-            "linked_trade_id": linked_trade_id,
-            "status":          "closed",
-            "pnl":             updated.get("pnl"),
-            "pnl_percent":     updated.get("pnl_percent"),
-            "holding_days":    updated.get("holding_days"),
-            "closed_at":       updated.get("closed_at"),
-            "ai_feedback":     feedback,
-        }
-        try:
-            save_trade(close_payload)
-        except Exception:
-            pass  # audit record failure is non-fatal
-
-        return FeedbackResponse(trade=Trade(**updated), feedback=feedback)
-
-    # ── Branch: standalone closed trade (intraday or swing without link) ─────
-    try:
-        if trade_type in SWING_TYPES:
-            user_history = get_user_trade_history(user_id)
-            feedback = generate_swing_feedback(trade_data, user_history, checklist=checklist_ctx)
-        else:
-            # Fetch market context (VIX + Greeks) for options trades — non-blocking
-            mkt_ctx = None
-            try:
-                mkt_ctx = get_market_context(
-                    trade_data.get("symbol", ""),
-                    trade_data.get("trade_date"),
-                )
-            except Exception:
-                pass
-            feedback = generate_trade_feedback(trade_data, market_context=mkt_ctx, checklist=checklist_ctx)
-    except Exception:
-        feedback = "Feedback unavailable at this time."
-
-    payload = {**trade_data, "user_id": user_id, "ai_feedback": feedback}
+    # ── Branch: all other trades (swing open, intraday, standalone closed) ────
+    payload = {**trade_data, "user_id": user_id}
     try:
         saved = save_trade(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save trade: {str(e)}")
 
-    return FeedbackResponse(trade=Trade(**saved), feedback=feedback)
+    return FeedbackResponse(trade=Trade(**saved), feedback="")
 
 
 # ── POST /trades/{trade_id}/close-manual ─────────────────────────────────────
