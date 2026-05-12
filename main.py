@@ -12,6 +12,7 @@ from routes.trades import router as trades_router
 from routes.import_trades import router as import_router
 from routes.payments import router as payments_router
 from routes.waitlist import router as waitlist_router
+from routes.auth import router as auth_router
 
 app = FastAPI(title="Tradfy API", version="1.0.0")
 app.state.limiter = limiter
@@ -38,6 +39,7 @@ app.include_router(trades_router)
 app.include_router(import_router)
 app.include_router(payments_router)
 app.include_router(waitlist_router)
+app.include_router(auth_router)
 
 
 @app.get("/")

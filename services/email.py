@@ -48,6 +48,38 @@ def send_payment_confirmation(email: str, name: str, expires_at: str):
     )
 
 
+def send_welcome_email(email: str, name: str):
+    first = name.split()[0] if name else "Trader"
+    _send(
+        to=email,
+        subject="Welcome to Traders Diary — your AI trade coach 🚀",
+        html=f"""
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:32px 24px;background:#060c18;color:#e2e8f0;border-radius:16px">
+          <div style="font-size:28px;font-weight:900;color:#ffffff;margin-bottom:8px">Traders Diary</div>
+          <div style="font-size:12px;color:#6366f1;letter-spacing:2px;text-transform:uppercase;margin-bottom:32px">Welcome aboard</div>
+
+          <p style="font-size:16px;margin:0 0 16px">Hi {first},</p>
+          <p style="font-size:16px;margin:0 0 24px">You now have an AI coach that reviews every trade you make — catching mistakes, spotting patterns, and helping you stop losing money on the same setups.</p>
+
+          <div style="background:#0d1528;border:1px solid #1c2e4a;border-radius:12px;padding:20px;margin-bottom:28px">
+            <p style="font-size:13px;font-weight:700;color:#a5b4fc;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px">Get started in 3 steps</p>
+            <p style="font-size:14px;color:#94a3b8;margin:0 0 8px">1. Upload a screenshot of any trade</p>
+            <p style="font-size:14px;color:#94a3b8;margin:0 0 8px">2. Get instant AI feedback on your setup</p>
+            <p style="font-size:14px;color:#94a3b8;margin:0">3. Import your full history via CSV for pattern analysis</p>
+          </div>
+
+          <p style="font-size:14px;color:#475569;margin:0 0 24px">You get <strong style="color:#e2e8f0">10 free AI analyses</strong> to start. Works with Zerodha, Upstox, Angel One, Dhan, Groww — or any broker via auto-detect.</p>
+
+          <a href="https://tradersdiary.in/upload" style="display:inline-block;background:linear-gradient(135deg,#4f46e5,#7c3aed);color:white;font-weight:700;font-size:14px;padding:12px 24px;border-radius:10px;text-decoration:none">
+            Upload your first trade →
+          </a>
+
+          <p style="font-size:11px;color:#334155;margin-top:40px">Traders Diary · Not investment advice · Educational tool only<br>Questions? Reply to this email or write to <a href="mailto:support@tradersdiary.in" style="color:#6366f1">support@tradersdiary.in</a></p>
+        </div>
+        """,
+    )
+
+
 def send_renewal_reminder(email: str, name: str, expires_at: str, days_left: int):
     first = name.split()[0] if name else "Trader"
     urgency = "⚠️ Expiring soon" if days_left > 2 else "🚨 Expiring tomorrow"
