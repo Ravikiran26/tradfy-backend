@@ -156,8 +156,6 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
     2. If that returns 0 trades OR raises an exception → fall back to Claude
     3. Claude fallback also returns 0 → raise so the user gets a clear error
     """
-    df = _read_file(file_bytes, filename)
-
     broker_lower = broker.lower().strip()
     parsers = {
         "zerodha":   parse_zerodha,
@@ -180,10 +178,13 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
         if broker_lower == "angelone":
             df_smart = _read_angelone_file(file_bytes, filename)
             return parse_angelone(df_smart)
+        df = _read_file(file_bytes, filename)
         return parsers[broker_lower](df)
 
-    # ── Unknown / auto broker → auto-detect first, then Claude ───────────────
+    # ── Unknown / auto broker → smart header scan, then detect, then Claude ──
     if broker_lower not in parsers:
+        # Use header-scanning read so metadata rows don't pollute column names
+        df = _read_file_with_header_scan(file_bytes, filename)
         detected = _detect_broker(df)
         if detected:
             broker_lower = detected
@@ -201,7 +202,8 @@ def parse_broker_file(file_bytes: bytes, filename: str, broker: str) -> list[dic
 
     # Specific parser returned nothing — try Claude before giving up
     try:
-        claude_trades = parse_generic_csv(df)
+        df_fallback = _read_file_with_header_scan(file_bytes, filename)
+        claude_trades = parse_generic_csv(df_fallback)
         if claude_trades:
             return claude_trades
     except Exception:
